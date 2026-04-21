@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent — runs the Daily Flash pipeline at 23:00 local time daily.
+  By default, cron.py targets TOMORROW's date (because it runs the night before).
+  So Tuesday 23:00 produces Wednesday's flash, ready on the dashboard before
+  Wed 06:00 when GR starts their shift.
+
+  To manually re-run for today instead, add <string>--today</string> to
+  ProgramArguments or run cron.py --today from the command line.
+
+  Install:
+    cp ops/launchd.plist ~/Library/LaunchAgents/com.daioscove.dailyflash.plist
+    # EDIT the placeholder paths first! See below.
+    launchctl load  ~/Library/LaunchAgents/com.daioscove.dailyflash.plist
+    launchctl start com.daioscove.dailyflash       # run once to test
+
+  Verify it's loaded:
+    launchctl list | grep dailyflash
+
+  Unload / remove:
+    launchctl unload ~/Library/LaunchAgents/com.daioscove.dailyflash.plist
+    rm ~/Library/LaunchAgents/com.daioscove.dailyflash.plist
+
+  Logs: /Users/dimitriosdaios/Library/Logs/daily-flash.{out,err}.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daioscove.dailyflash</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/dimitriosdaios/daily-flash/.venv/bin/python</string>
+        <string>/Users/dimitriosdaios/daily-flash/src/cron.py</string>
+        <string>--fallback-latest</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/dimitriosdaios/daily-flash</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DAILY_FLASH_INBOX</key>
+        <string>/Users/dimitriosdaios/Library/CloudStorage/OneDrive-HellasHolidayHotelsSA/DailyFlash</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>23</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dimitriosdaios/Library/Logs/daily-flash.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dimitriosdaios/Library/Logs/daily-flash.err.log</string>
+</dict>
+</plist>

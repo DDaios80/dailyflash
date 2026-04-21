@@ -1,0 +1,19 @@
+# Railway configuration for the Daily Flash pipeline (cron job service).
+#
+# Deploy:
+#   1. Push this repo to GitHub.
+#   2. In Railway dashboard → New Project → Deploy from GitHub repo.
+#   3. Settings → set the cron schedule below (UI) or rely on this file.
+#   4. Variables → paste env (see .env.example).
+#
+# Cron schedule: 21:00 UTC = 23:00 Athens (winter / EET) / 00:00 (summer / EEST).
+# This fires ~1h before GR's morning shift so the dashboard is ready either way.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -u src/cron.py --use-cache"
+cronSchedule = "0 21 * * *"
+restartPolicyType = "NEVER"
