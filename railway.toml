@@ -14,6 +14,6 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "python -u src/cron.py --use-cache"
+startCommand = "python -u src/cron.py"
 cronSchedule = "0 21 * * *"
 restartPolicyType = "NEVER"

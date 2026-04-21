@@ -14,5 +14,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 
 # Railway cron runs this command daily.
-# --use-cache hits the existing researched_subjects cache (fast + cheap).
-CMD ["python", "-u", "src/cron.py", "--use-cache"]
+CMD ["python", "-u", "src/cron.py"]
