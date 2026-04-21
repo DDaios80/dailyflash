@@ -124,11 +124,17 @@ STRUCTURED_COLUMNS = {
 
 
 def _clean(v: Any) -> Any:
-    """Turn pandas NaN / empty strings into None; keep datetimes and numbers as-is."""
+    """Turn pandas NaN / NaT / empty strings into None; keep datetimes and numbers as-is."""
     if v is None:
         return None
-    if isinstance(v, float) and math.isnan(v):
-        return None
+    # pandas NaT is not None and not float-NaN, but isinstance(pd.NaT, datetime) is True —
+    # so it would sneak past later coerce checks and blow up date comparisons downstream.
+    # pd.isna handles None, NaN, NaT, and pandas NA in one shot (scalars only).
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass  # non-scalar (list/dict/array) — fall through
     if isinstance(v, str):
         s = v.strip()
         return s if s else None
@@ -225,6 +231,21 @@ def is_real_reservation(row: dict[str, Any]) -> bool:
     return True
 
 
+def _coerce_numeric(v: Any) -> float | None:
+    """Coerce to float for numeric DB columns. Returns None for non-numeric strings
+    (e.g. Opera summary rows that leak free-text into rate columns like
+    'TRate=20,252,634')."""
+    v = _clean(v)
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def _coerce_room(v: Any) -> str | None:
     """Room codes are alphanumeric (e.g. 108, 9000, PI) but pandas reads purely numeric
     ones as float. Normalise to a clean string without a trailing .0."""
@@ -255,6 +276,8 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         rec[intcol] = _coerce_int(row.get(intcol))
     for bigintcol in ("guest_name_id", "resv_name_id"):
         rec[bigintcol] = _coerce_int(row.get(bigintcol))
+    # Numeric money columns — Opera leaks summary-row free-text here occasionally.
+    rec["total_rate"] = _coerce_numeric(row.get("total_rate"))
 
     # Everything else → raw
     raw = {}
