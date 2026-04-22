@@ -6,9 +6,17 @@
 #   3. Settings → set the cron schedule below (UI) or rely on this file.
 #   4. Variables → paste env (see .env.example).
 #
-# Cron schedule: 19:30 Athens (TZ=Europe/Athens env var pins this regardless of DST).
-# Pipeline fires before the 20:00 email dispatcher so flash_reports is fresh for
-# tomorrow when emails go out.
+# Cron schedule: Railway cron is in UTC (NOT respecting TZ env var — confirmed
+# via Railway UI showing "At HH:MM (UTC)" labels). Current setting is tuned for
+# summer (EEST = UTC+3):
+#   16:30 UTC = 19:30 Athens EEST (summer, April-October)
+#             = 18:30 Athens EET  (winter, October-March  ← 1h off)
+# Pipeline fires ~30 min before the 20:00 Athens email dispatcher so
+# flash_reports is fresh for tomorrow's date.
+#
+# DST reminder — on the last Sunday of October (EEST→EET), bump this to
+# "30 17 * * *" (= 17:30 UTC = 19:30 Athens EET). Reverse on the last
+# Sunday of March.
 
 [build]
 builder = "DOCKERFILE"
@@ -16,5 +24,5 @@ dockerfilePath = "Dockerfile"
 
 [deploy]
 startCommand = "python -u src/cron.py"
-cronSchedule = "30 19 * * *"
+cronSchedule = "30 16 * * *"
 restartPolicyType = "NEVER"
