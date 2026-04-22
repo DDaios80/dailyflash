@@ -8,8 +8,10 @@
 --   Tier A — full guest detail (allergies, VIPs, A-lister findings):
 --     admin, management, guest_relations, front_office, housekeeping, fnb,
 --     maintenance, reservations, kepos, kids_club, sales
+--   Tier B+ — metrics + A-lister (social / brand / phone ID use cases):
+--     marketing, call_center
 --   Tier B — metrics only (occupancy, weather, briefing; no guest PII):
---     marketing, accounting, it, call_center, general
+--     accounting, it, general
 --
 -- Safe to run multiple times (idempotent).
 
@@ -47,12 +49,14 @@ as $$
 $$;
 
 -- A-lister findings and reasoning — restricted to roles that work with
--- the information directly. `sales` included per user's explicit request.
+-- the information directly. Includes `sales` (DOS-level VIP visibility),
+-- `marketing` (social media / brand partnerships with notable guests), and
+-- `call_center` (phone operators should recognize A-lister names on calls).
 create or replace function can_see_alister() returns boolean
   language sql stable security definer set search_path = public
 as $$
   select coalesce(current_user_role() in (
-    'admin','management','guest_relations','sales'
+    'admin','management','guest_relations','sales','marketing','call_center'
   ), false);
 $$;
 

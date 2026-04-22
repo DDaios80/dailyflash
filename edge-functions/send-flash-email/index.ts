@@ -147,11 +147,13 @@ const SECTIONS_BY_ROLE: Record<UserRole, Section[]> = {
     "birthdays_in_house",
   ],
 
+  // Tier B+ — metrics + A-lister (social / brand partnerships / phone ID)
+  marketing: ["occupancy", "alister_findings", "daily_briefing"],
+  call_center: ["occupancy", "alister_findings", "daily_briefing"],
+
   // Tier B — metrics only, no guest PII
-  marketing: ["occupancy", "daily_briefing"],
   accounting: ["occupancy", "daily_briefing"],
   it: ["occupancy", "daily_briefing"],
-  call_center: ["occupancy", "daily_briefing"],
   general: ["occupancy", "daily_briefing"],
 };
 
