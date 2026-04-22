@@ -6,8 +6,9 @@
 #   3. Settings → set the cron schedule below (UI) or rely on this file.
 #   4. Variables → paste env (see .env.example).
 #
-# Cron schedule: 21:00 UTC = 23:00 Athens (winter / EET) / 00:00 (summer / EEST).
-# This fires ~1h before GR's morning shift so the dashboard is ready either way.
+# Cron schedule: 19:30 Athens (TZ=Europe/Athens env var pins this regardless of DST).
+# Pipeline fires before the 20:00 email dispatcher so flash_reports is fresh for
+# tomorrow when emails go out.
 
 [build]
 builder = "DOCKERFILE"
@@ -15,5 +16,5 @@ dockerfilePath = "Dockerfile"
 
 [deploy]
 startCommand = "python -u src/cron.py"
-cronSchedule = "0 21 * * *"
+cronSchedule = "30 19 * * *"
 restartPolicyType = "NEVER"
