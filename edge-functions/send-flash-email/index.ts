@@ -178,6 +178,12 @@ const ROLE_LABEL: Record<UserRole, string> = {
 
 const DEFAULT_APPROVER = "thelxi.smyrnaki@daioshotels.com";
 
+// Roles that see the full PDF (with A-lister). Anyone not in this set gets
+// the redacted PDF. Matches can_see_alister() in phase5_email_roles.sql.
+const ALISTER_ROLES: UserRole[] = [
+  "admin", "management", "guest_relations", "sales", "marketing", "call_center",
+];
+
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 Deno.serve(async (req) => {
@@ -196,6 +202,7 @@ Deno.serve(async (req) => {
     "https://daioscove-flash.lovable.app";
   const approverEmail = (Deno.env.get("APPROVER_EMAIL") ?? DEFAULT_APPROVER).toLowerCase();
   const approveFnUrl = Deno.env.get("APPROVE_FLASH_EMAIL_URL") ?? "";
+  const pdfFnUrl = Deno.env.get("GENERATE_FLASH_PDF_URL") ?? "";
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
@@ -234,6 +241,20 @@ Deno.serve(async (req) => {
     recipients = recipients.filter((r) => onlyRecipients.includes(r.email.toLowerCase()));
   }
 
+  // Pre-fetch both PDF variants once per run. Fail-soft: if PDF generation
+  // throws we still send the email without the attachment, with an error
+  // logged. This avoids blocking the whole batch on a Browserless hiccup.
+  const pdfCache: PdfCache = { full: null, redacted: null };
+  const secret = pipelineSecret;
+  if (pdfFnUrl) {
+    const [full, redacted] = await Promise.all([
+      fetchFlashPdfBase64({ pdfFnUrl, secret, date: reportDate, includeAlister: true }),
+      fetchFlashPdfBase64({ pdfFnUrl, secret, date: reportDate, includeAlister: false }),
+    ]);
+    pdfCache.full = full;
+    pdfCache.redacted = redacted;
+  }
+
   // ─── Mode dispatch ────────────────────────────────────────────────────
   if (mode === "preview") {
     return await handlePreview({
@@ -247,6 +268,7 @@ Deno.serve(async (req) => {
       fromAddress,
       resendKey,
       dryRun,
+      pdfCache,
     });
   }
 
@@ -262,6 +284,7 @@ Deno.serve(async (req) => {
       resendKey,
       dryRun,
       submittedToken,
+      pdfCache,
     });
   }
 
@@ -275,11 +298,18 @@ Deno.serve(async (req) => {
       fromAddress,
       resendKey,
       dryRun,
+      pdfCache,
     });
   }
 
   return json({ error: `unknown mode: ${mode}` }, 400);
 });
+
+type PdfCache = { full: string | null; redacted: string | null };
+
+function pickPdfForRole(role: UserRole, cache: PdfCache): string | null {
+  return ALISTER_ROLES.includes(role) ? cache.full : cache.redacted;
+}
 
 // ─── Mode handlers ─────────────────────────────────────────────────────────
 
@@ -294,6 +324,7 @@ async function handlePreview(opts: {
   fromAddress: string;
   resendKey: string;
   dryRun: boolean;
+  pdfCache: PdfCache;
 }): Promise<Response> {
   const approver = opts.recipients.find(
     (r) => r.email.toLowerCase() === opts.approverEmail,
@@ -356,6 +387,7 @@ async function handlePreview(opts: {
   }
 
   const deliveries: DeliveryLog[] = [];
+  const pdfB64 = pickPdfForRole(approver.role, opts.pdfCache);
   try {
     const msgId = await sendViaResend({
       to: approver.email,
@@ -363,6 +395,10 @@ async function handlePreview(opts: {
       subject: `[APPROVAL] Daily Flash preview — ${formatAthensDate(opts.reportDate)}`,
       html,
       apiKey: opts.resendKey,
+      attachment: pdfB64 ? {
+        filename: `daios-flash-${opts.reportDate}.pdf`,
+        content_base64: pdfB64,
+      } : undefined,
     });
     deliveries.push({
       recipient_email: approver.email,
@@ -415,6 +451,7 @@ async function handleFanout(opts: {
   resendKey: string;
   dryRun: boolean;
   submittedToken: string | undefined;
+  pdfCache: PdfCache;
 }): Promise<Response> {
   if (!opts.submittedToken) {
     return json({ error: "approval_token required for mode=fanout" }, 400);
@@ -452,6 +489,7 @@ async function handleFanout(opts: {
     fromAddress: opts.fromAddress,
     resendKey: opts.resendKey,
     dryRun: opts.dryRun,
+    pdfCache: opts.pdfCache,
   });
 
   await opts.supa.from("email_deliveries").insert(
@@ -494,6 +532,7 @@ async function handleDirect(opts: {
   fromAddress: string;
   resendKey: string;
   dryRun: boolean;
+  pdfCache: PdfCache;
 }): Promise<Response> {
   const deliveries = await sendToAll({
     recipients: opts.recipients,
@@ -503,6 +542,7 @@ async function handleDirect(opts: {
     fromAddress: opts.fromAddress,
     resendKey: opts.resendKey,
     dryRun: opts.dryRun,
+    pdfCache: opts.pdfCache,
   });
   await opts.supa.from("email_deliveries").insert(
     deliveries.map((d) => ({
@@ -538,6 +578,7 @@ async function sendToAll(opts: {
   fromAddress: string;
   resendKey: string;
   dryRun: boolean;
+  pdfCache: PdfCache;
 }): Promise<DeliveryLog[]> {
   const out: DeliveryLog[] = [];
   for (const r of opts.recipients) {
@@ -565,6 +606,7 @@ async function sendToAll(opts: {
       continue;
     }
 
+    const pdfB64 = pickPdfForRole(r.role, opts.pdfCache);
     try {
       const msgId = await sendViaResend({
         to: r.email,
@@ -572,6 +614,10 @@ async function sendToAll(opts: {
         subject,
         html,
         apiKey: opts.resendKey,
+        attachment: pdfB64 ? {
+          filename: `daios-flash-${opts.reportDate}.pdf`,
+          content_base64: pdfB64,
+        } : undefined,
       });
       out.push({
         recipient_email: r.email,
@@ -625,24 +671,66 @@ async function sendViaResend(opts: {
   subject: string;
   html: string;
   apiKey: string;
+  attachment?: { filename: string; content_base64: string };
 }): Promise<string> {
+  const body: Record<string, unknown> = {
+    from: opts.from,
+    to: [opts.to],
+    subject: opts.subject,
+    html: opts.html,
+  };
+  if (opts.attachment) {
+    body.attachments = [{
+      filename: opts.attachment.filename,
+      content: opts.attachment.content_base64,
+    }];
+  }
   const resp = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${opts.apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      from: opts.from,
-      to: [opts.to],
-      subject: opts.subject,
-      html: opts.html,
-    }),
+    body: JSON.stringify(body),
   });
   const text = await resp.text();
   if (!resp.ok) throw new Error(`Resend ${resp.status}: ${text}`);
   const parsed = JSON.parse(text);
   return parsed.id ?? "";
+}
+
+// Fetches one PDF variant from the generate-flash-pdf edge function and
+// returns the base64 string. Called up to twice per send-flash-email run —
+// once with include_alister=true, once with false — and the results are
+// cached in a Map keyed by variant for the duration of the run.
+async function fetchFlashPdfBase64(opts: {
+  pdfFnUrl: string;
+  secret: string;
+  date: string;
+  includeAlister: boolean;
+}): Promise<string | null> {
+  try {
+    const resp = await fetch(opts.pdfFnUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${opts.secret}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        date: opts.date,
+        include_alister: opts.includeAlister,
+      }),
+    });
+    if (!resp.ok) {
+      console.error(`generate-flash-pdf ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+      return null;
+    }
+    const json = await resp.json();
+    return json.pdf_base64 ?? null;
+  } catch (e) {
+    console.error("generate-flash-pdf fetch failed:", (e as Error).message);
+    return null;
+  }
 }
 
 // ─── HTML rendering ────────────────────────────────────────────────────────
