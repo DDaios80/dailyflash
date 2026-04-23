@@ -1,17 +1,21 @@
 // parse-fam-trip-itinerary — Lovable Cloud edge function.
 //
-// Given a FAM trip id, downloads its PDF from Supabase Storage, extracts
-// the text via pdf-parse, sends the text to Lovable AI Gateway (Gemini
-// 2.5 Pro by default) with JSON-mode on, and UPDATEs
-// fam_trips.itinerary_by_day with the parsed result.
+// Given a FAM trip id, downloads its PDF from Supabase Storage, base64-
+// encodes it, and sends it as a multimodal attachment to Lovable AI
+// Gateway (Gemini 2.5 Pro). Gemini parses the PDF natively — including
+// PowerPoint-exported PDFs with non-standard TrueType glyph tables that
+// trip up text-only extractors like pdf-parse. UPDATEs
+// fam_trips.itinerary_by_day with the parsed JSON result.
 //
-// Rationale for Lovable AI over Anthropic direct:
-//   * FAM trip PDFs are well-structured operational documents — clear
-//     date headings + time-stamped bullets. Not a nuanced reasoning task
-//     where Claude's edge over Gemini matters meaningfully.
-//   * Consistent with analyze-idea (also on Lovable AI Gateway).
-//   * No separate ANTHROPIC_API_KEY to manage per edge function.
-//   * ~60x cheaper per parse (though volume is trivially small anyway).
+// Notes:
+//   * Uses LOVABLE_API_KEY (auto-provisioned when the AI integration is
+//     active on the project). No Anthropic key required.
+//   * ~60x cheaper per parse than an Anthropic Haiku equivalent, though
+//     volume here is tiny.
+//   * Previous revisions tried pdf-parse text extraction — that worked
+//     for simple PDFs but failed silently (0 days, no error) on
+//     PowerPoint exports with custom fonts. Multimodal ingestion is
+//     the durable fix.
 //
 // Contract:
 //   POST /functions/v1/parse-fam-trip-itinerary
@@ -19,7 +23,6 @@
 //   Body:     { "trip_id": "uuid" }
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import pdfParse from "npm:pdf-parse@1.1.1";
 
 const MODEL = Deno.env.get("ITINERARY_MODEL") ?? "google/gemini-2.5-pro";
 const LOVABLE_AI_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
@@ -65,31 +68,21 @@ Deno.serve(async (req) => {
     return json({ error: msg }, 502);
   }
 
-  // Extract text
-  let pdfText: string;
-  try {
-    const buf = new Uint8Array(await blob.arrayBuffer());
-    // pdf-parse accepts Buffer or Uint8Array
-    const parsedPdf = await pdfParse(buf);
-    pdfText = (parsedPdf.text ?? "").trim();
-  } catch (e) {
-    const msg = "pdf text extraction failed: " + String((e as Error)?.message ?? e).slice(0, 300);
-    await recordError(supa, tripId, msg);
-    return json({ error: msg }, 502);
-  }
+  // Base64-encode the PDF to pass directly to Gemini via Lovable AI Gateway.
+  // This bypasses pdf-parse entirely — Gemini's native multimodal pipeline
+  // handles PowerPoint-exported PDFs with non-standard TrueType fonts that
+  // would trip up glyph-table-based text extractors.
+  const pdfBuffer = new Uint8Array(await blob.arrayBuffer());
+  const pdfBase64 = bufferToBase64(pdfBuffer);
 
-  if (pdfText.length < 50) {
-    await recordError(supa, tripId, `extracted text too short (${pdfText.length} chars)`);
-    return json({ error: "PDF has no extractable text (scan-only?)" }, 422);
-  }
-
-  // Call Lovable AI
+  // Call Lovable AI with PDF attachment
   let parsed: Record<string, Activity[]> | null = null;
   let aiErr: string | null = null;
   try {
     parsed = await extractItinerary({
       apiKey: lovableKey,
-      pdfText,
+      pdfBase64,
+      pdfFilename: (trip.pdf_path as string).split("/").pop() ?? "fam-trip.pdf",
       tripName: trip.name as string,
       startDate: trip.start_date as string,
       endDate: trip.end_date as string,
@@ -124,7 +117,7 @@ Deno.serve(async (req) => {
     days_parsed: dayCount,
     activities_parsed: activityCount,
     model: MODEL,
-    pdf_text_chars: pdfText.length,
+    pdf_bytes: pdfBuffer.length,
   });
 });
 
@@ -140,14 +133,23 @@ interface Activity {
 
 async function extractItinerary(opts: {
   apiKey: string;
-  pdfText: string;
+  pdfBase64: string;
+  pdfFilename: string;
   tripName: string;
   startDate: string;
   endDate: string;
 }): Promise<Record<string, Activity[]>> {
-  const systemPrompt = SYSTEM_PROMPT;
-  const userPrompt = buildUserPrompt(opts);
+  const textInstruction = [
+    `Trip: ${opts.tripName}`,
+    `Date range: ${opts.startDate} to ${opts.endDate}`,
+    ``,
+    `Extract the day-by-day itinerary from the attached PDF. Only include dates between ${opts.startDate} and ${opts.endDate} inclusive. Return the JSON object now.`,
+  ].join("\n");
 
+  // Multimodal message with the PDF attached. Gemini via Lovable AI Gateway
+  // (OpenAI-compatible) accepts PDFs as image_url with a data:application/pdf
+  // URI — Gemini's vision pipeline handles document layout + embedded text
+  // without relying on TrueType glyph decoding.
   const resp = await fetch(LOVABLE_AI_URL, {
     method: "POST",
     headers: {
@@ -157,8 +159,19 @@ async function extractItinerary(opts: {
     body: JSON.stringify({
       model: MODEL,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user",   content: userPrompt },
+        { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: textInstruction },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:application/pdf;base64,${opts.pdfBase64}`,
+              },
+            },
+          ],
+        },
       ],
       response_format: { type: "json_object" },
       temperature: 0.2,
@@ -183,7 +196,7 @@ async function extractItinerary(opts: {
   return normaliseItinerary(parsed, opts.startDate, opts.endDate);
 }
 
-const SYSTEM_PROMPT = `You extract day-by-day itineraries from hotel FAM trip documents. The input is plain text extracted from a PDF. Output is a strict JSON object keyed by ISO date with arrays of activities.
+const SYSTEM_PROMPT = `You extract day-by-day itineraries from hotel FAM trip PDFs. The user message will include the PDF as an attachment. Output is a strict JSON object keyed by ISO date with arrays of activities.
 
 Rules:
 - Output ONLY a JSON object. No prose, no code fences. Start with "{" and end with "}".
@@ -203,24 +216,6 @@ Return shape:
   ],
   ...
 }`;
-
-function buildUserPrompt(opts: {
-  pdfText: string; tripName: string; startDate: string; endDate: string;
-}): string {
-  return [
-    `Trip: ${opts.tripName}`,
-    `Date range: ${opts.startDate} to ${opts.endDate}`,
-    ``,
-    `Extract the day-by-day itinerary. Only include dates between ${opts.startDate} and ${opts.endDate} inclusive.`,
-    ``,
-    `DOCUMENT TEXT:`,
-    `---`,
-    opts.pdfText,
-    `---`,
-    ``,
-    `Return the JSON object now.`,
-  ].join("\n");
-}
 
 // ─── JSON extraction + normalisation ───────────────────────────────────────
 
@@ -302,6 +297,16 @@ async function recordError(supa: any, tripId: string, msg: string): Promise<void
       itinerary_parsed_at: new Date().toISOString(),
     }).eq("id", tripId);
   } catch (_) { /* best-effort */ }
+}
+
+function bufferToBase64(buf: Uint8Array): string {
+  // Chunked to avoid stack-overflow on large PDFs via apply(null, ...huge array)
+  const chunkSize = 32768;
+  let binary = "";
+  for (let i = 0; i < buf.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + chunkSize)) as number[]);
+  }
+  return btoa(binary);
 }
 
 function json(p: unknown, s = 200) {
