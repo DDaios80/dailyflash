@@ -1,18 +1,17 @@
 // parse-fam-trip-itinerary — Lovable Cloud edge function.
 //
-// Given a FAM trip id, downloads its PDF from Supabase Storage, passes it
-// natively to Claude Haiku 4.5 (cheap + solid at PDF extraction), asks
-// Claude to return a day-by-day itinerary as JSON, and UPDATEs the
-// fam_trips.itinerary_by_day column with the result.
+// Given a FAM trip id, downloads its PDF from Supabase Storage, extracts
+// the text via pdf-parse, sends the text to Lovable AI Gateway (Gemini
+// 2.5 Pro by default) with JSON-mode on, and UPDATEs
+// fam_trips.itinerary_by_day with the parsed result.
 //
-// Design notes:
-//   * Anthropic direct API (not Lovable AI Gateway) because Claude's
-//     native PDF handling is meaningfully better for itinerary extraction
-//     than any OpenAI-compatible alternative through the gateway.
-//   * Model: claude-haiku-4-5 ($1/$5 per 1M tokens, ~$0.02 per FAM trip
-//     parse). Low volume (few trips per month) makes cost trivial.
-//   * Idempotent: re-running overwrites itinerary_by_day. Admin "Re-parse"
-//     button hits this same endpoint.
+// Rationale for Lovable AI over Anthropic direct:
+//   * FAM trip PDFs are well-structured operational documents — clear
+//     date headings + time-stamped bullets. Not a nuanced reasoning task
+//     where Claude's edge over Gemini matters meaningfully.
+//   * Consistent with analyze-idea (also on Lovable AI Gateway).
+//   * No separate ANTHROPIC_API_KEY to manage per edge function.
+//   * ~60x cheaper per parse (though volume is trivially small anyway).
 //
 // Contract:
 //   POST /functions/v1/parse-fam-trip-itinerary
@@ -20,9 +19,10 @@
 //   Body:     { "trip_id": "uuid" }
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import pdfParse from "npm:pdf-parse@1.1.1";
 
-const MODEL = Deno.env.get("ITINERARY_MODEL") ?? "claude-haiku-4-5";
-const ANTHROPIC_VERSION = "2023-06-01";
+const MODEL = Deno.env.get("ITINERARY_MODEL") ?? "google/gemini-2.5-pro";
+const LOVABLE_AI_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 
 Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
@@ -31,10 +31,10 @@ Deno.serve(async (req) => {
   const auth = req.headers.get("authorization") ?? "";
   if (!secret || auth !== `Bearer ${secret}`) return json({ error: "unauthorized" }, 401);
 
-  const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY");
-  const supabaseUrl  = Deno.env.get("SUPABASE_URL");
-  const serviceKey   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!anthropicKey) return json({ error: "ANTHROPIC_API_KEY not set" }, 500);
+  const lovableKey  = Deno.env.get("LOVABLE_API_KEY");
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceKey  = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!lovableKey)  return json({ error: "LOVABLE_API_KEY not set" }, 500);
   if (!supabaseUrl || !serviceKey) return json({ error: "Supabase env missing" }, 500);
 
   const body = await req.json().catch(() => ({}));
@@ -64,15 +64,32 @@ Deno.serve(async (req) => {
     await recordError(supa, tripId, msg);
     return json({ error: msg }, 502);
   }
-  const pdfBase64 = bufferToBase64(new Uint8Array(await blob.arrayBuffer()));
 
-  // Ask Claude
+  // Extract text
+  let pdfText: string;
+  try {
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    // pdf-parse accepts Buffer or Uint8Array
+    const parsedPdf = await pdfParse(buf);
+    pdfText = (parsedPdf.text ?? "").trim();
+  } catch (e) {
+    const msg = "pdf text extraction failed: " + String((e as Error)?.message ?? e).slice(0, 300);
+    await recordError(supa, tripId, msg);
+    return json({ error: msg }, 502);
+  }
+
+  if (pdfText.length < 50) {
+    await recordError(supa, tripId, `extracted text too short (${pdfText.length} chars)`);
+    return json({ error: "PDF has no extractable text (scan-only?)" }, 422);
+  }
+
+  // Call Lovable AI
   let parsed: Record<string, Activity[]> | null = null;
   let aiErr: string | null = null;
   try {
     parsed = await extractItinerary({
-      apiKey: anthropicKey,
-      pdfBase64,
+      apiKey: lovableKey,
+      pdfText,
       tripName: trip.name as string,
       startDate: trip.start_date as string,
       endDate: trip.end_date as string,
@@ -107,103 +124,105 @@ Deno.serve(async (req) => {
     days_parsed: dayCount,
     activities_parsed: activityCount,
     model: MODEL,
+    pdf_text_chars: pdfText.length,
   });
 });
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 interface Activity {
-  time: string | null;    // "HH:MM" or null for non-timed activities
+  time: string | null;
   title: string;
   detail?: string;
 }
 
-// ─── Claude call (PDF native ingestion) ─────────────────────────────────────
+// ─── Lovable AI Gateway call ────────────────────────────────────────────────
 
 async function extractItinerary(opts: {
   apiKey: string;
-  pdfBase64: string;
+  pdfText: string;
   tripName: string;
   startDate: string;
   endDate: string;
 }): Promise<Record<string, Activity[]>> {
-  const userPrompt = [
-    `Extract the day-by-day itinerary from this FAM trip PDF.`,
-    ``,
-    `Trip: ${opts.tripName}`,
-    `Date range: ${opts.startDate} to ${opts.endDate}`,
-    ``,
-    `For every day covered by the PDF, extract each scheduled activity and return a JSON object keyed by ISO date (YYYY-MM-DD) whose values are arrays of activities.`,
-    ``,
-    `Activity shape: { "time": "HH:MM" | null, "title": "short label", "detail": "one-sentence summary including pax, location, flight, or contact if mentioned" }.`,
-    ``,
-    `Rules:`,
-    `- Only include days within the trip's date range (${opts.startDate} .. ${opts.endDate}).`,
-    `- time is null for non-timed items (e.g. "Breakfast at leisure").`,
-    `- detail stays one sentence. Pack pax counts, flight numbers, restaurant names, and named attendees into it.`,
-    `- Keep titles short (<= 8 words). Use imperative / noun-phrase form: "Gatwick arrival", "Dinner at Taverna", "Ball Room session".`,
-    `- Do NOT invent activities. If the PDF has no structured schedule for a day, return an empty array for that day.`,
-    `- Return ONLY the JSON object. Start with "{" and end with "}". No preamble, no code fences, no trailing prose.`,
-    ``,
-    `Example return shape:`,
-    `{`,
-    `  "${opts.startDate}": [`,
-    `    {"time": "13:10", "title": "Gatwick arrival", "detail": "22 pax on EZY8215, shared minibus transfer to DC arriving ~15:00"},`,
-    `    {"time": "19:30", "title": "Dinner at Taverna", "detail": "14 agents + host (Scott or Lyndsey)"}`,
-    `  ]`,
-    `}`,
-  ].join("\n");
+  const systemPrompt = SYSTEM_PROMPT;
+  const userPrompt = buildUserPrompt(opts);
 
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+  const resp = await fetch(LOVABLE_AI_URL, {
     method: "POST",
     headers: {
-      "x-api-key": opts.apiKey,
-      "anthropic-version": ANTHROPIC_VERSION,
-      "content-type": "application/json",
+      "Authorization": `Bearer ${opts.apiKey}`,
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 8000,
       messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: opts.pdfBase64,
-              },
-            },
-            { type: "text", text: userPrompt },
-          ],
-        },
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userPrompt },
       ],
+      response_format: { type: "json_object" },
+      temperature: 0.2,
+      max_tokens: 8000,
     }),
   });
 
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`Anthropic ${resp.status}: ${text.slice(0, 400)}`);
+    throw new Error(`Lovable AI ${resp.status}: ${text.slice(0, 400)}`);
   }
 
-  const data = await resp.json() as { content: Array<{ type: string; text?: string }> };
-  let lastText = "";
-  for (const block of data.content || []) {
-    if (block.type === "text" && typeof block.text === "string") {
-      lastText = block.text;
-    }
-  }
-  if (!lastText) throw new Error("no text in Claude response");
+  const data = await resp.json() as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = data.choices?.[0]?.message?.content ?? "";
+  if (!content) throw new Error("no content in Lovable AI response");
 
-  const parsed = parseJsonObject(lastText);
-  if (!parsed) throw new Error(`could not parse JSON: ${lastText.slice(0, 300)}`);
+  const parsed = parseJsonObject(content);
+  if (!parsed) throw new Error(`could not parse JSON: ${content.slice(0, 300)}`);
 
   return normaliseItinerary(parsed, opts.startDate, opts.endDate);
 }
 
-// ─── JSON extraction + validation ──────────────────────────────────────────
+const SYSTEM_PROMPT = `You extract day-by-day itineraries from hotel FAM trip documents. The input is plain text extracted from a PDF. Output is a strict JSON object keyed by ISO date with arrays of activities.
+
+Rules:
+- Output ONLY a JSON object. No prose, no code fences. Start with "{" and end with "}".
+- Activity shape: { "time": "HH:MM" | null, "title": "short label", "detail": "one-sentence summary" }.
+- Include only days within the trip's stated date range.
+- time = null for non-timed items (e.g. "Breakfast at leisure", "Free time").
+- detail stays a single sentence. Pack pax counts, flight numbers, restaurant names, named attendees into it.
+- Keep titles short (<= 8 words). Imperative / noun-phrase form: "Gatwick arrival", "Dinner at Taverna".
+- Do NOT invent activities. If a day in the range has no structured schedule in the text, return an empty array for it.
+- If you are uncertain about a time, set time=null and include the uncertainty in detail ("~morning", "after breakfast").
+
+Return shape:
+{
+  "YYYY-MM-DD": [
+    {"time": "HH:MM" | null, "title": string, "detail": string},
+    ...
+  ],
+  ...
+}`;
+
+function buildUserPrompt(opts: {
+  pdfText: string; tripName: string; startDate: string; endDate: string;
+}): string {
+  return [
+    `Trip: ${opts.tripName}`,
+    `Date range: ${opts.startDate} to ${opts.endDate}`,
+    ``,
+    `Extract the day-by-day itinerary. Only include dates between ${opts.startDate} and ${opts.endDate} inclusive.`,
+    ``,
+    `DOCUMENT TEXT:`,
+    `---`,
+    opts.pdfText,
+    `---`,
+    ``,
+    `Return the JSON object now.`,
+  ].join("\n");
+}
+
+// ─── JSON extraction + normalisation ───────────────────────────────────────
 
 function parseJsonObject(text: string): any | null {
   let t = text.trim();
@@ -262,7 +281,6 @@ function normaliseItinerary(
         acts.push({ time, title, detail });
       }
     }
-    // Sort by time ASC, nulls last
     acts.sort((x, y) => {
       if (x.time === null && y.time === null) return 0;
       if (x.time === null) return 1;
@@ -284,15 +302,6 @@ async function recordError(supa: any, tripId: string, msg: string): Promise<void
       itinerary_parsed_at: new Date().toISOString(),
     }).eq("id", tripId);
   } catch (_) { /* best-effort */ }
-}
-
-function bufferToBase64(buf: Uint8Array): string {
-  const chunkSize = 32768;
-  let binary = "";
-  for (let i = 0; i < buf.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + chunkSize)) as number[]);
-  }
-  return btoa(binary);
 }
 
 function json(p: unknown, s = 200) {
