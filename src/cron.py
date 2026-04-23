@@ -107,8 +107,11 @@ def main() -> int:
 
     # Production (Railway): pull today's xlsx from OneDrive via Graph API.
     # Dev/local (launchd): read from a OneDrive-synced folder on disk.
+    birthdays_path: Path | None = None
     if os.environ.get("MSGRAPH_CLIENT_ID") and os.environ.get("MSGRAPH_REFRESH_TOKEN"):
-        from onedrive import fetch_latest_xlsx, GraphError
+        from onedrive import (
+            fetch_latest_xlsx, fetch_latest_xlsx_from_subfolder, GraphError,
+        )
         try:
             tmp = Path(os.environ.get("DAILY_FLASH_TMP", "/tmp/daily-flash"))
             xlsx = fetch_latest_xlsx(tmp)
@@ -116,6 +119,17 @@ def main() -> int:
         except GraphError as e:
             print(f"[cron] OneDrive fetch failed: {e}", file=sys.stderr)
             return 2
+        # Best-effort pull of the comprehensive birthdays file. Missing file
+        # is NOT fatal — pipeline falls back to Opera-comment extraction.
+        try:
+            birthdays_path = fetch_latest_xlsx_from_subfolder("Birthdays", tmp)
+            if birthdays_path:
+                print(f"[cron] pulled birthdays from OneDrive: {birthdays_path.name}")
+            else:
+                print("[cron] no birthdays file found in OneDrive Birthdays/ subfolder")
+        except GraphError as e:
+            print(f"[cron] birthdays fetch failed (continuing): {e}", file=sys.stderr)
+            birthdays_path = None
     else:
         inbox = Path(args.inbox).expanduser()
         xlsx = find_xlsx_for(target, inbox)
@@ -124,11 +138,26 @@ def main() -> int:
         if xlsx is None:
             print(f"[cron] no xlsx found for {target} in {inbox}", file=sys.stderr)
             return 2
+        # Look for a birthdays file in the local DailyFlash/Birthdays/ folder
+        local_birthdays_dir = inbox / "Birthdays"
+        if local_birthdays_dir.exists():
+            candidates = sorted(
+                [p for p in local_birthdays_dir.iterdir()
+                 if p.is_file() and p.suffix.lower() == ".xlsx"],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                birthdays_path = candidates[0]
+                print(f"[cron] local birthdays file: {birthdays_path.name}")
 
     print(f"[cron] pipeline — date={target}, file={xlsx}")
     from daily import run_daily
     try:
-        run_daily(str(xlsx), target)
+        run_daily(
+            str(xlsx), target,
+            birthdays_xlsx_path=str(birthdays_path) if birthdays_path else None,
+        )
     except Exception as e:
         print(f"[cron] pipeline failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1

@@ -105,8 +105,14 @@ def assemble_payload_in_memory(
     promoted_rooms: set | None = None,
     daily_briefing: dict | None = None,
     pool_heating: list[dict] | None = None,
+    birthdays_override: list[dict] | None = None,
 ) -> dict:
-    """Build the flash_reports.payload from in-memory data (no DB query)."""
+    """Build the flash_reports.payload from in-memory data (no DB query).
+
+    If `birthdays_override` is provided (from the comprehensive OneDrive
+    birthdays file), it replaces the Opera-reservations-derived
+    birthdays_today list from compute_flash.
+    """
     promoted_rooms = promoted_rooms or set()
     flash = compute_flash(records, report_date, promoted_rooms=promoted_rooms)
 
@@ -147,7 +153,10 @@ def assemble_payload_in_memory(
         "special_attention_departures": _enrich(flash.special_attention_departures),
         "complimentary_partner_arrivals": _enrich(flash.complimentary_partner_arrivals),
         "pep_arrivals": _enrich(flash.pep_arrivals),
-        "birthdays_in_house": _enrich(flash.birthdays_today),
+        "birthdays_in_house": (
+            birthdays_override if birthdays_override is not None
+            else _enrich(flash.birthdays_today)
+        ),
         "allergies_in_house": _enrich(flash.allergies_in_house),
         "alister_findings": al_panel_rows,
         "alister_findings_count": len(al_panel_rows),
@@ -174,12 +183,24 @@ def run_daily(
     use_cache: bool = False,       # default OFF — cache now lives in Lovable Cloud, warms via edge function
     extract_window_days: int = 7,
     dry_run: bool = False,
+    birthdays_xlsx_path: str | None = None,
 ) -> dict:
     print(f"=== DAILY PIPELINE (bridge) — report_date={report_date} ===\n")
 
     # Step 1 — parse
     records = parse_file(xlsx_path)
     print(f"[1/5] Parsed {len(records)} reservations from {Path(xlsx_path).name}")
+
+    # Step 1b — comprehensive birthdays file (optional)
+    birthdays_override: list[dict] | None = None
+    if birthdays_xlsx_path:
+        from birthdays import load_birthdays
+        try:
+            birthdays_override = load_birthdays(birthdays_xlsx_path, report_date)
+            print(f"[1b] Birthdays file: {len(birthdays_override)} in-house birthdays for {report_date}")
+        except Exception as e:
+            print(f"[1b] Birthdays file failed ({type(e).__name__}: {e}) — falling back to Opera extraction")
+            birthdays_override = None
 
     # Step 2 — LLM COMMENTS extraction
     extractions_by_rnid: dict[int, dict] = {}
@@ -221,6 +242,7 @@ def run_daily(
     flash_report_payload = assemble_payload_in_memory(
         records, extractions_by_rnid, findings_by_rnid,
         report_date, weather,
+        birthdays_override=birthdays_override,
     )
     envelope = build_envelope(
         report_date=report_date,
@@ -260,6 +282,9 @@ def main() -> int:
                     help="Use the legacy Supabase cache (external project). OFF by default.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Build the envelope but don't POST. Writes to /tmp.")
+    ap.add_argument("--birthdays", default=None,
+                    help="Path to the Opera birthdays xlsx (eur_birthday_v.*.xlsx). "
+                         "If given, overrides the Opera reservations-derived birthday list.")
     args = ap.parse_args()
 
     try:
@@ -270,6 +295,7 @@ def main() -> int:
             run_alister=not args.no_alister,
             use_cache=args.use_cache,
             dry_run=args.dry_run,
+            birthdays_xlsx_path=args.birthdays,
         )
     except Exception as e:
         print(f"\npipeline failed: {type(e).__name__}: {e}", file=sys.stderr)
