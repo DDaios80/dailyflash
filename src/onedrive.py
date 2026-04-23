@@ -17,6 +17,7 @@ Env vars:
 from __future__ import annotations
 
 import os
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -64,17 +65,24 @@ def _refresh_access_token(cfg: dict) -> str:
     return data["access_token"]
 
 
-def _list_and_download_latest(folder_path: str, target_dir: Path) -> Optional[Path]:
-    """Internal — list folder_path, download the most-recently-modified .xlsx.
-    Returns None if folder doesn't exist or contains no xlsx. Raises GraphError
-    on auth / network errors."""
-    cfg = _config()
-    token = _refresh_access_token(cfg)
-    headers = {"Authorization": f"Bearer {token}"}
+def _download_item(item: dict, headers: dict, target_dir: Path) -> Path:
+    """Download a Graph item (xlsx) to target_dir and return the local path."""
+    dl = item.get("@microsoft.graph.downloadUrl") or f"{_GRAPH}/me/drive/items/{item['id']}/content"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    local_path = target_dir / item["name"]
+    rr = requests.get(dl, headers=headers, timeout=180)
+    if rr.status_code >= 400:
+        raise GraphError(f"download failed ({rr.status_code}): {rr.text[:500]}")
+    local_path.write_bytes(rr.content)
+    return local_path
 
+
+def _list_xlsx(folder_path: str, headers: dict) -> Optional[list[dict]]:
+    """List xlsx items in a folder, sorted by lastModifiedDateTime desc.
+    Returns None if folder doesn't exist."""
     list_url = (
         f"{_GRAPH}/me/drive/root:/{folder_path}:/children"
-        "?$orderby=lastModifiedDateTime desc&$top=25"
+        "?$orderby=lastModifiedDateTime desc&$top=50"
         "&$select=id,name,lastModifiedDateTime,@microsoft.graph.downloadUrl"
     )
     r = requests.get(list_url, headers=headers, timeout=30)
@@ -83,37 +91,101 @@ def _list_and_download_latest(folder_path: str, target_dir: Path) -> Optional[Pa
     if r.status_code >= 400:
         raise GraphError(f"folder listing failed ({r.status_code}): {r.text[:500]}")
     items = r.json().get("value", [])
-    xlsx = [i for i in items if i.get("name", "").lower().endswith(".xlsx")]
-    if not xlsx:
-        return None
-    latest = xlsx[0]
+    return [i for i in items if i.get("name", "").lower().endswith(".xlsx")]
 
-    dl = latest.get("@microsoft.graph.downloadUrl") or f"{_GRAPH}/me/drive/items/{latest['id']}/content"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    local_path = target_dir / latest["name"]
-    rr = requests.get(dl, headers=headers, timeout=180)
-    if rr.status_code >= 400:
-        raise GraphError(f"download failed ({rr.status_code}): {rr.text[:500]}")
-    local_path.write_bytes(rr.content)
-    return local_path
+
+def _list_and_download_latest(folder_path: str, target_dir: Path) -> Optional[Path]:
+    """Internal — list folder_path, download the most-recently-modified .xlsx.
+    Returns None if folder doesn't exist or contains no xlsx. Raises GraphError
+    on auth / network errors."""
+    cfg = _config()
+    token = _refresh_access_token(cfg)
+    headers = {"Authorization": f"Bearer {token}"}
+    xlsx = _list_xlsx(folder_path, headers)
+    if xlsx is None or not xlsx:
+        return None
+    return _download_item(xlsx[0], headers, target_dir)
+
+
+def _match_date_in_name(name: str, d: date) -> bool:
+    """Does the filename contain a DD.MM.YYYY or DD-MM-YYYY or YYYY-MM-DD
+    stamp matching `d`?"""
+    patterns = [
+        f"{d.day:02d}.{d.month:02d}.{d.year:04d}",
+        f"{d.day:02d}-{d.month:02d}-{d.year:04d}",
+        f"{d.year:04d}-{d.month:02d}-{d.day:02d}",
+    ]
+    n = name.lower()
+    return any(p.lower() in n for p in patterns)
+
+
+def _fetch_dated_xlsx_with_fallback(
+    folder_path: str,
+    target_date: date,
+    target_dir: Path,
+) -> tuple[Optional[Path], bool]:
+    """List folder_path, try to find an xlsx whose filename contains
+    target_date (DD.MM.YYYY, DD-MM-YYYY, or YYYY-MM-DD). On hit → download
+    and return (path, is_stale=False). On miss → download latest-modified
+    and return (path, is_stale=True). On empty folder / missing folder →
+    (None, False).
+    """
+    cfg = _config()
+    token = _refresh_access_token(cfg)
+    headers = {"Authorization": f"Bearer {token}"}
+    xlsx = _list_xlsx(folder_path, headers)
+    if xlsx is None or not xlsx:
+        return (None, False)
+    for item in xlsx:
+        if _match_date_in_name(item.get("name", ""), target_date):
+            return (_download_item(item, headers, target_dir), False)
+    # Fall back to latest-modified
+    return (_download_item(xlsx[0], headers, target_dir), True)
 
 
 def fetch_latest_xlsx(target_dir: Path) -> Path:
-    """Download the most-recently-modified .xlsx from the DailyFlash folder.
-
-    Looks first in the base folder (for backward compat with the old flat
-    layout), then falls back to the 'Daily Flash' subfolder which is the
-    current layout used in OneDrive.
+    """Legacy: download the most-recently-modified .xlsx. Prefer
+    fetch_daily_flash_for_date() for new code — it's date-aware.
     """
     cfg = _config()
-    # Try base folder first
     path = _list_and_download_latest(cfg["folder"], target_dir)
     if path:
         return path
-    # Fall back to "Daily Flash" subfolder
     path = _list_and_download_latest(f"{cfg['folder']}/Daily Flash", target_dir)
     if path:
         return path
+    raise GraphError(
+        f"no .xlsx found in OneDrive folder '{cfg['folder']}' "
+        f"or '{cfg['folder']}/Daily Flash'"
+    )
+
+
+def fetch_daily_flash_for_date(
+    export_date: date, target_dir: Path,
+) -> tuple[Path, bool]:
+    """Download the Daily Flash xlsx whose filename matches `export_date`
+    (DD.MM.YYYY). If no exact match, falls back to the latest-modified xlsx
+    in the folder.
+
+    Returns (local_path, is_stale). Caller should log a warning when is_stale
+    is True — it means the operator hasn't uploaded today's export yet.
+
+    Looks first in {folder}/Daily Flash, then falls back to the base folder
+    for backward compatibility with the old flat layout.
+    """
+    cfg = _config()
+    # Try "Daily Flash" subfolder (current layout)
+    path, stale = _fetch_dated_xlsx_with_fallback(
+        f"{cfg['folder']}/Daily Flash", export_date, target_dir,
+    )
+    if path:
+        return (path, stale)
+    # Fall back to base folder (old flat layout)
+    path, stale = _fetch_dated_xlsx_with_fallback(
+        cfg["folder"], export_date, target_dir,
+    )
+    if path:
+        return (path, stale)
     raise GraphError(
         f"no .xlsx found in OneDrive folder '{cfg['folder']}' "
         f"or '{cfg['folder']}/Daily Flash'"
@@ -144,11 +216,22 @@ def fetch_xlsx_by_name(name: str, target_dir: Path) -> Path:
 
 
 def fetch_latest_xlsx_from_subfolder(subfolder: str, target_dir: Path) -> Optional[Path]:
-    """Download the most-recently-modified .xlsx from a subfolder of the base
-    DailyFlash folder (e.g. 'Birthdays'). Returns None if subfolder is empty
-    or missing — caller decides whether that's fatal.
+    """Legacy: most-recently-modified .xlsx from a subfolder. Prefer
+    fetch_birthdays_for_date() for the Birthdays subfolder.
     """
     cfg = _config()
     return _list_and_download_latest(
         f"{cfg['folder']}/{subfolder}".strip("/"), target_dir,
+    )
+
+
+def fetch_birthdays_for_date(
+    export_date: date, target_dir: Path,
+) -> tuple[Optional[Path], bool]:
+    """Download the birthdays xlsx from DailyFlash/Birthdays/ matching
+    `export_date`. Returns (path, is_stale). On empty/missing folder returns
+    (None, False) — the birthdays file is optional."""
+    cfg = _config()
+    return _fetch_dated_xlsx_with_fallback(
+        f"{cfg['folder']}/Birthdays", export_date, target_dir,
     )

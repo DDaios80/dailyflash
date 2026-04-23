@@ -107,24 +107,45 @@ def main() -> int:
 
     # Production (Railway): pull today's xlsx from OneDrive via Graph API.
     # Dev/local (launchd): read from a OneDrive-synced folder on disk.
+    #
+    # Strategy: look for a file whose name contains today's date (the EXPORT
+    # date — Maria/Thelxi export once per day). On miss, fall back to the
+    # latest-modified xlsx and log a stale warning so operators can catch
+    # the missed upload.
     birthdays_path: Path | None = None
+    today_athens = datetime.now().date()  # Railway service runs with TZ=Europe/Athens
     if os.environ.get("MSGRAPH_CLIENT_ID") and os.environ.get("MSGRAPH_REFRESH_TOKEN"):
         from onedrive import (
-            fetch_latest_xlsx, fetch_latest_xlsx_from_subfolder, GraphError,
+            fetch_daily_flash_for_date, fetch_birthdays_for_date, GraphError,
         )
         try:
             tmp = Path(os.environ.get("DAILY_FLASH_TMP", "/tmp/daily-flash"))
-            xlsx = fetch_latest_xlsx(tmp)
-            print(f"[cron] pulled from OneDrive via Graph API: {xlsx.name}")
+            xlsx, is_stale = fetch_daily_flash_for_date(today_athens, tmp)
+            tag = "STALE FALLBACK" if is_stale else "exact date match"
+            print(f"[cron] pulled daily flash ({tag}): {xlsx.name}")
+            if is_stale:
+                print(
+                    f"[cron] WARNING: no xlsx filename matched {today_athens.isoformat()} "
+                    f"— using latest-modified '{xlsx.name}'. Operator may have forgotten "
+                    f"to upload today's export.",
+                    file=sys.stderr,
+                )
         except GraphError as e:
             print(f"[cron] OneDrive fetch failed: {e}", file=sys.stderr)
             return 2
         # Best-effort pull of the comprehensive birthdays file. Missing file
         # is NOT fatal — pipeline falls back to Opera-comment extraction.
         try:
-            birthdays_path = fetch_latest_xlsx_from_subfolder("Birthdays", tmp)
+            birthdays_path, b_stale = fetch_birthdays_for_date(today_athens, tmp)
             if birthdays_path:
-                print(f"[cron] pulled birthdays from OneDrive: {birthdays_path.name}")
+                btag = "STALE FALLBACK" if b_stale else "exact date match"
+                print(f"[cron] pulled birthdays ({btag}): {birthdays_path.name}")
+                if b_stale:
+                    print(
+                        f"[cron] WARNING: no birthdays xlsx matched {today_athens.isoformat()} "
+                        f"— using latest-modified '{birthdays_path.name}'.",
+                        file=sys.stderr,
+                    )
             else:
                 print("[cron] no birthdays file found in OneDrive Birthdays/ subfolder")
         except GraphError as e:
