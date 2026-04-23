@@ -74,8 +74,9 @@ COMMENT_ATTENTION_PHRASES = (
 )
 
 # Travel-agent / group names that warrant special attention on their own.
+# NOTE: WebHotelier is excluded — it's the direct-booking engine, not a TA.
+# Flagging every WebHotelier booking was noise; removed 23 Apr 2026.
 NOTABLE_AGENT_KEYWORDS = (
-    "WEBHOTELIER",
     "DERTOUR", "DER TOUR",
     "NYHAVN",
     "ODEON",
