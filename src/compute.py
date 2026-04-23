@@ -51,7 +51,6 @@ def _in_house_on(r: dict[str, Any], d: date) -> bool:
 
 COMPLIMENTARY_GROUP_KEYWORDS = ("COMPLIMENTARY",)
 PEP_GROUP_KEYWORDS = ("PEP",)
-AIRTOURS_KEYWORDS = ("AIRTOURS",)
 FF_KEYWORDS = ("F&F", "FAMILY & FRIENDS", "FAM&FRIENDS")
 
 ALLERGY_KEYWORDS = (
@@ -74,13 +73,12 @@ COMMENT_ATTENTION_PHRASES = (
 )
 
 # Travel-agent / group names that warrant special attention on their own.
-# NOTE: WebHotelier is excluded — it's the direct-booking engine, not a TA.
-# Flagging every WebHotelier booking was noise; removed 23 Apr 2026.
+# Kept tight to genuine luxury channels. Removed 23 Apr 2026:
+#   WEBHOTELIER — direct booking engine, not a TA
+#   AIRTOURS, DERTOUR, DER TOUR, JET2 — bulk contract tour operators, not VIP
 NOTABLE_AGENT_KEYWORDS = (
-    "DERTOUR", "DER TOUR",
     "NYHAVN",
     "ODEON",
-    "JET2",
     "STRONG TRAVEL",
     "VIRTUOSO",
 )
@@ -142,8 +140,6 @@ def special_attention_reason(r: dict[str, Any]) -> str | None:
         reasons.append("PEP")
 
     g = (r.get("group_name") or "").upper()
-    if any(k in g for k in AIRTOURS_KEYWORDS):
-        reasons.append("Airtours")
     if any(k in g for k in FF_KEYWORDS):
         reasons.append("F&F")
 
