@@ -59,6 +59,11 @@ def _findings_by_resv(findings: list) -> dict[int, list[dict]]:
             "summary": f.summary,
             "evidence_urls": f.evidence_urls or [],
             "reasoning": f.reasoning,
+            "photo_url": f.photo_url,
+            "disprove_confidence": f.disprove_confidence,
+            "disprove_reasoning": f.disprove_reasoning,
+            "nationality_aligned": f.nationality_aligned,
+            "review_status": f.review_status,
         })
     return out
 
@@ -90,6 +95,12 @@ def _researched_subjects_from_findings(findings: list) -> list[dict]:
             "summary": f.summary,
             "reasoning": f.reasoning,
             "evidence_urls": f.evidence_urls or [],
+            "photo_url": f.photo_url,
+            "disprove_confidence": f.disprove_confidence,
+            "disprove_reasoning": f.disprove_reasoning,
+            "nationality_aligned": f.nationality_aligned,
+            "review_status": f.review_status,
+            "schema_version": 2,
             "researched_at": now,
         })
     return rows
@@ -126,12 +137,17 @@ def assemble_payload_in_memory(
             out.append(g2)
         return out
 
-    # A-lister panel: confidence ≥ 70, sorted by confidence desc
+    # A-lister panel: only surface confirmed or needs_review findings
+    # (review_status is computed in alister.py from confidence + disprove pass).
     rec_by_rnid = {r.get("resv_name_id"): r for r in records if r.get("resv_name_id")}
     al_panel_rows: list[dict] = []
     for rnid, finds in findings_by_rnid.items():
         for f in finds:
-            if (f.get("confidence") or 0) < 70:
+            status = f.get("review_status") or "needs_review"
+            if status not in ("confirmed", "needs_review"):
+                continue
+            # Belt-and-braces: still require ≥85 confidence + is_notable
+            if not f.get("is_notable") or (f.get("confidence") or 0) < 85:
                 continue
             rec = rec_by_rnid.get(rnid) or {}
             guest = f"{(rec.get('guest_first_name') or '').strip()} {(rec.get('guest_name') or '').strip()}".strip()
@@ -140,7 +156,13 @@ def assemble_payload_in_memory(
                 "room": rec.get("room"),
                 "guest_on_booking": guest,
             })
-    al_panel_rows.sort(key=lambda a: -(a.get("confidence") or 0))
+    # Sort: confirmed first, then needs_review; within tier, by confidence desc.
+    al_panel_rows.sort(
+        key=lambda a: (
+            0 if a.get("review_status") == "confirmed" else 1,
+            -(a.get("confidence") or 0),
+        )
+    )
 
     all_alister_count = sum(len(fs) for fs in findings_by_rnid.values())
 

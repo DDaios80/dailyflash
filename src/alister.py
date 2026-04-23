@@ -45,8 +45,13 @@ load_dotenv(ENV_PATH, override=True)
 
 DEFAULT_MODEL = os.environ.get("DAILY_FLASH_MODEL", "claude-opus-4-7")
 DEFAULT_CONCURRENCY = int(os.environ.get("DAILY_FLASH_CONCURRENCY", "3"))
-DEFAULT_CONFIDENCE_THRESHOLD = 70
+DEFAULT_CONFIDENCE_THRESHOLD = 85  # raised from 70 after false-positive review
 DEFAULT_CACHE_TTL_DAYS = 180  # 6 months — repeater guests unlikely to change
+SCHEMA_VERSION = 2  # bump on schema or prompt changes — invalidates old cache rows
+
+# Disprove pass thresholds
+DISPROVE_OVERRIDE_AT = 60   # disprove_confidence ≥ this => override is_notable=false
+CONFIRMED_AT = 95            # confidence ≥ this (after disprove) => review_status=confirmed
 
 
 # ─── Schema ─────────────────────────────────────────────────────────────────
@@ -68,6 +73,27 @@ class AListerFinding(BaseModel):
     evidence_urls: list[str] = Field(default_factory=list)
     reasoning: Optional[str] = Field(
         default=None, description="Brief justification of confidence (what disambiguated the match)."
+    )
+    # ─── Phase-10 hardening fields ─────────────────────────────────────────
+    photo_url: Optional[str] = Field(
+        default=None,
+        description="URL of an official / Wikipedia-infobox photo. REQUIRED when is_notable=true (human visual sanity check)."
+    )
+    disprove_confidence: int = Field(
+        default=0, ge=0, le=100,
+        description="Adversarial second-pass result: how strong the counter-evidence is. ≥60 = override is_notable to false."
+    )
+    disprove_reasoning: Optional[str] = Field(
+        default=None,
+        description="Disprove-pass reasoning — what pointed against the match, or why the match still holds."
+    )
+    nationality_aligned: Optional[str] = Field(
+        default=None,
+        description="'yes' | 'unknown' | 'no' — whether the notable figure's known nationality matches the booking."
+    )
+    review_status: str = Field(
+        default="needs_review",
+        description="'confirmed' (≥CONFIRMED_AT + passes disprove) | 'needs_review' (threshold..CONFIRMED_AT) | 'rejected' (below threshold or disprove override)."
     )
 
 
@@ -177,34 +203,44 @@ financiers, royalty, high-profile investors, etc.
 
 Your job: given ONE subject (name + nationality + context), use web_search to \
 determine whether they are a publicly notable person, and return a structured \
-JSON finding.
+JSON finding. A later adversarial pass will try to disprove your match — so \
+err on the side of caution rather than eagerness.
 
 Rules:
 1. Use web_search efficiently — 1 to 3 targeted queries are usually enough. \
    Combine the full name with nationality, industry hints, or the partner's \
    name when useful. Prefer authoritative sources: Wikipedia, LinkedIn, \
    company about-pages, major news outlets.
-2. Be skeptical of common names. John Smith from the UK is not notable \
-   without a specific match. Require:
+2. Be very skeptical of common names. John Smith from the UK is not notable \
+   without a specific, disambiguating match. Require:
    - At least ONE concrete, dated, verifiable piece of evidence (role title, \
      company, published work, team affiliation).
    - Nationality / context match (do not confuse two people sharing a name).
-3. Confidence score:
-   - 90–100: multiple reputable sources, context matches cleanly
-   - 70–89: one strong source + context match
-   - 50–69: plausible but ambiguous — DO NOT flag as notable
-   - 0–49: common name / no evidence
-4. `is_notable=true` only if confidence ≥ 70 AND the person has public \
-   standing the hotel would want to know about. Don't flag private \
-   professionals (accountants, local GPs) as notable.
+   - If there are multiple notable people with the same name and you cannot \
+     disambiguate from booking context, set is_notable=false (confidence ≤50).
+3. Confidence score (calibrated tight):
+   - 95–100: multiple reputable independent sources, context matches cleanly, \
+     a Wikipedia page or equivalent exists, photo available.
+   - 85–94: one strong authoritative source + context match + photo.
+   - 70–84: plausible but single-source or ambiguous — DO NOT flag (is_notable=false).
+   - 0–69: common name / no evidence.
+4. `is_notable=true` only if confidence ≥ 85 AND the person has public \
+   standing the hotel would want to know about. Do not flag private \
+   professionals (accountants, local GPs, mid-level managers).
 5. `category` must be one of: CEO/Founder, Executive, Investor, Athlete, \
    Actor, Musician, Artist, Author, Journalist, Politician, Scientist, \
    Academic, Royalty, Influencer, Media Personality, Other. Null if not \
    notable.
-6. `evidence_urls` — up to 3 links you actually used to reach the conclusion.
-7. `reasoning` — one short sentence explaining what disambiguated the match \
+6. `evidence_urls` — up to 3 links you actually used. At least one must be \
+   from a reputable source (Wikipedia, Forbes, major news, official company \
+   or team site) when is_notable=true.
+7. `photo_url` — REQUIRED when is_notable=true. Must be a direct link to a \
+   recognisable face photo (Wikipedia infobox image, official company bio \
+   headshot, verified social profile photo). If you cannot find a photo, set \
+   is_notable=false. Set photo_url=null when is_notable=false.
+8. `reasoning` — one short sentence explaining what disambiguated the match \
    (or why you're not confident).
-8. Return ONLY the JSON object. No preamble. No code fences. No trailing \
+9. Return ONLY the JSON object. No preamble. No code fences. No trailing \
    explanation. Your response MUST start with `{` and end with `}`. Anything \
    else will be treated as a malformed response.
 
@@ -217,8 +253,51 @@ JSON schema (all fields required):
   "category": string | null,
   "summary": string | null,
   "evidence_urls": string[],
+  "photo_url": string | null,
   "reasoning": string | null
 }
+"""
+
+
+DISPROVE_SYSTEM_PROMPT = """\
+You audit tentative A-lister matches for false positive risk at a 5-star \
+hotel. An earlier research pass flagged a guest as possibly being a public \
+figure. Your job is to find reasons the match is WRONG — the actual guest is \
+likely a different person who happens to share the name.
+
+Look for:
+- How common is this name? Many equally plausible candidates exist?
+- Does the notable figure's known nationality, location, or profession \
+  CONFLICT with the booking context?
+- Is the notable figure deceased, retired, or very elderly in a way that \
+  makes leisure travel implausible?
+- Does the booking channel (travel agent / tour operator / company / \
+  accompanying names) contradict the notable figure's lifestyle, wealth, or \
+  known associations?
+- Is the photo on their public profile clearly a different age, gender, or \
+  ethnicity from a plausible hotel guest?
+
+Use web_search if useful (up to 3 queries). Then return ONLY this JSON — no \
+prose, no code fences, response MUST start with `{` and end with `}`:
+
+{
+  "disprove_confidence": integer 0-100,
+  "reasons": string[],
+  "nationality_aligned": "yes" | "unknown" | "no",
+  "verdict": "confirmed" | "uncertain" | "rejected"
+}
+
+Guidelines:
+- disprove_confidence: 0 = candidate match looks solid; 100 = clearly wrong person.
+- reasons: up to 3 specific, concrete reasons to doubt the match (cite facts). \
+  Empty array if none found.
+- nationality_aligned: "yes" if the notable figure's known nationality is \
+  compatible with the booking nationality; "no" if there's a clear conflict; \
+  "unknown" if neither can be determined confidently.
+- verdict:
+  - "rejected" → you found concrete counter-evidence (set disprove_confidence ≥70)
+  - "uncertain" → ambiguous / common name with no clear disambiguator (30-59)
+  - "confirmed" → no strong counter-evidence, match still plausible (0-29)
 """
 
 
@@ -233,7 +312,35 @@ def _user_prompt(s: Subject) -> str:
         parts.append(f"Company on booking: {s.company}")
     if s.other_party_members:
         parts.append("Travelling with: " + ", ".join(s.other_party_members))
-    parts.append("\nResearch whether this person is publicly notable. Return the JSON finding.")
+    parts.append("\nResearch whether this person is publicly notable. Remember: photo_url is REQUIRED when is_notable=true. Return the JSON finding.")
+    return "\n".join(parts)
+
+
+def _disprove_user_prompt(s: Subject, f: "AListerFinding") -> str:
+    parts = ["BOOKING CONTEXT:"]
+    parts.append(f"- Name: {s.display}")
+    if s.nationality:
+        parts.append(f"- Nationality: {s.nationality}")
+    if s.travel_agent:
+        parts.append(f"- Travel agent: {s.travel_agent}")
+    if s.company:
+        parts.append(f"- Company: {s.company}")
+    if s.other_party_members:
+        parts.append(f"- Accompanying: {', '.join(s.other_party_members)}")
+    parts.append("")
+    parts.append("TENTATIVE MATCH:")
+    parts.append(f"- Notable figure: {f.matched_name}")
+    if f.category:
+        parts.append(f"- Category: {f.category}")
+    if f.summary:
+        parts.append(f"- Summary: {f.summary}")
+    parts.append(f"- Original confidence: {f.confidence}/100")
+    if f.photo_url:
+        parts.append(f"- Photo: {f.photo_url}")
+    if f.evidence_urls:
+        parts.append(f"- Evidence: {', '.join(f.evidence_urls[:3])}")
+    parts.append("")
+    parts.append("Now find reasons this is WRONG. Return the JSON finding.")
     return "\n".join(parts)
 
 
@@ -304,49 +411,187 @@ def _build_finding(data: dict, subject: Subject) -> Optional[AListerFinding]:
         return None
 
 
+async def _claude_with_retry(
+    client: AsyncAnthropic,
+    *,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 4000,
+) -> tuple[Optional[str], Optional[str]]:
+    """Single Claude + web_search call with 529/5xx retry. Returns (text, err)."""
+    last_err: Optional[str] = None
+    for attempt in range(4):
+        try:
+            response = await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=[{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}],
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            text = ""
+            for block in reversed(response.content):
+                if block.type == "text":
+                    text = block.text
+                    break
+            return text, None
+        except APIStatusError as e:
+            status = getattr(e, "status_code", None)
+            if status is not None and 500 <= status < 600:
+                last_err = f"APIStatusError {status}"
+            else:
+                return None, f"{type(e).__name__}: {e}"
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+        await asyncio.sleep(2 * (2 ** attempt) + 1)
+    return None, last_err or "retries exhausted"
+
+
+def _parse_disprove_text(text: str) -> Optional[dict]:
+    """Extract the disprove-pass JSON. Returns dict or None."""
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\s*```\s*$", "", text)
+    decoder = json.JSONDecoder()
+    for i, c in enumerate(text):
+        if c != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if "disprove_confidence" not in data and "verdict" not in data:
+            continue
+        # Normalise
+        dc = data.get("disprove_confidence", 0)
+        try:
+            dc = max(0, min(100, int(dc)))
+        except (TypeError, ValueError):
+            dc = 0
+        reasons = data.get("reasons") or []
+        if not isinstance(reasons, list):
+            reasons = []
+        reasons = [str(r)[:300] for r in reasons if r][:3]
+        nat = data.get("nationality_aligned")
+        if nat not in ("yes", "no", "unknown"):
+            nat = "unknown"
+        verdict = data.get("verdict")
+        if verdict not in ("confirmed", "uncertain", "rejected"):
+            # Infer from disprove_confidence
+            verdict = "rejected" if dc >= 60 else ("uncertain" if dc >= 30 else "confirmed")
+        return {
+            "disprove_confidence": dc,
+            "reasons": reasons,
+            "nationality_aligned": nat,
+            "verdict": verdict,
+        }
+    return None
+
+
+def _compute_review_status(f: AListerFinding) -> str:
+    """Derive review_status from confidence + disprove signals.
+
+    Rules:
+      - disprove_confidence >= DISPROVE_OVERRIDE_AT → 'rejected' (is_notable forced false upstream)
+      - nationality_aligned == 'no' AND confidence < 95 → 'rejected'
+      - is_notable=false → 'rejected'
+      - confidence >= CONFIRMED_AT → 'confirmed'
+      - confidence >= DEFAULT_CONFIDENCE_THRESHOLD → 'needs_review'
+      - else → 'rejected'
+    """
+    if f.disprove_confidence >= DISPROVE_OVERRIDE_AT:
+        return "rejected"
+    if f.nationality_aligned == "no" and f.confidence < CONFIRMED_AT:
+        return "rejected"
+    if not f.is_notable:
+        return "rejected"
+    if f.confidence >= CONFIRMED_AT:
+        return "confirmed"
+    if f.confidence >= DEFAULT_CONFIDENCE_THRESHOLD:
+        return "needs_review"
+    return "rejected"
+
+
 async def _research_one(
     client: AsyncAnthropic,
     subject: Subject,
     model: str,
     semaphore: asyncio.Semaphore,
 ) -> tuple[Subject, Optional[AListerFinding], Optional[str]]:
-    """Research one subject with retry on 529 overload."""
+    """Research one subject (2 passes: research + adversarial disprove)."""
     async with semaphore:
-        last_err: Optional[str] = None
-        for attempt in range(4):  # 1 try + 3 retries
-            try:
-                response = await client.messages.create(
-                    model=model,
-                    max_tokens=4000,  # big enough to avoid mid-JSON truncation
-                    system=[{
-                        "type": "text",
-                        "text": SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }],
-                    tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}],
-                    messages=[{"role": "user", "content": _user_prompt(subject)}],
-                )
-                text = ""
-                for block in reversed(response.content):
-                    if block.type == "text":
-                        text = block.text
-                        break
-                finding = _parse_finding_text(text, subject)
-                if finding is None:
-                    return subject, None, f"could not parse JSON from final message: {text[:200]!r}"
-                return subject, finding, None
-            except APIStatusError as e:
-                # 529 overload, 500/502/503 = transient; retry. 4xx = give up.
-                status = getattr(e, "status_code", None)
-                if status is not None and 500 <= status < 600:
-                    last_err = f"APIStatusError {status}"
+        # Pass 1: research
+        text, err = await _claude_with_retry(
+            client, model=model,
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=_user_prompt(subject),
+        )
+        if err:
+            return subject, None, err
+        finding = _parse_finding_text(text or "", subject)
+        if finding is None:
+            return subject, None, f"could not parse JSON from pass-1: {(text or '')[:200]!r}"
+
+        # Hard schema guard: if is_notable=true but no photo_url, downgrade.
+        if finding.is_notable and not (finding.photo_url and finding.photo_url.startswith("http")):
+            finding = finding.model_copy(update={
+                "is_notable": False,
+                "confidence": min(finding.confidence, 60),
+                "reasoning": (finding.reasoning or "") + " [auto-rejected: no photo_url provided]",
+            })
+
+        # Pass 2: disprove (only if pass 1 flagged notable — saves tokens)
+        if finding.is_notable:
+            dtext, derr = await _claude_with_retry(
+                client, model=model,
+                system_prompt=DISPROVE_SYSTEM_PROMPT,
+                user_prompt=_disprove_user_prompt(subject, finding),
+                max_tokens=1500,
+            )
+            if derr:
+                # Disprove pass failed — be conservative, mark needs_review
+                finding = finding.model_copy(update={
+                    "disprove_reasoning": f"disprove pass error: {derr[:200]}",
+                })
+            else:
+                parsed = _parse_disprove_text(dtext or "")
+                if parsed is None:
+                    finding = finding.model_copy(update={
+                        "disprove_reasoning": f"disprove pass returned unparseable: {(dtext or '')[:200]}",
+                    })
                 else:
-                    return subject, None, f"{type(e).__name__}: {e}"
-            except Exception as e:
-                return subject, None, f"{type(e).__name__}: {e}"
-            # Exponential backoff: 2s, 5s, 12s
-            await asyncio.sleep(2 * (2 ** attempt) + 1)
-        return subject, None, last_err or "retries exhausted"
+                    dc = parsed["disprove_confidence"]
+                    reasons = parsed["reasons"]
+                    nat = parsed["nationality_aligned"]
+                    verdict = parsed["verdict"]
+                    new_is_notable = finding.is_notable and dc < DISPROVE_OVERRIDE_AT
+                    update = {
+                        "is_notable": new_is_notable,
+                        "disprove_confidence": dc,
+                        "disprove_reasoning": (
+                            "; ".join(reasons) if reasons
+                            else f"verdict={verdict}, no counter-evidence found"
+                        ),
+                        "nationality_aligned": nat,
+                    }
+                    if not new_is_notable and verdict == "rejected":
+                        # Also knock down confidence to reflect the rejection
+                        update["confidence"] = max(0, finding.confidence - 30)
+                    finding = finding.model_copy(update=update)
+
+        # Derive review_status last, from all signals
+        finding = finding.model_copy(update={"review_status": _compute_review_status(finding)})
+        return subject, finding, None
 
 
 def _cache_key(subject: Subject) -> tuple[str, str, str | None]:
@@ -361,6 +606,8 @@ def _load_cache(subjects: list[Subject], ttl_days: int) -> dict[tuple[str, str, 
     """Fetch any recent cached findings for the given subjects.
 
     Returns a dict keyed by (first_lower, last_lower, nationality) → finding.
+    Only rows with matching schema_version are honoured; older rows are
+    skipped so new hardening signals are always filled.
     Subjects without a first+last name aren't cacheable (nothing to key on).
     """
     from supa import client  # lazy
@@ -381,6 +628,9 @@ def _load_cache(subjects: list[Subject], ttl_days: int) -> dict[tuple[str, str, 
     )
     by_key: dict[tuple[str, str, str | None], AListerFinding] = {}
     for row in res.data or []:
+        # Skip rows from before schema hardening — force re-research
+        if (row.get("schema_version") or 1) < SCHEMA_VERSION:
+            continue
         key = (
             (row.get("first_name") or "").strip().lower(),
             (row.get("last_name") or "").strip().lower(),
@@ -396,6 +646,11 @@ def _load_cache(subjects: list[Subject], ttl_days: int) -> dict[tuple[str, str, 
                 summary=row.get("summary"),
                 evidence_urls=row.get("evidence_urls") or [],
                 reasoning=row.get("reasoning"),
+                photo_url=row.get("photo_url"),
+                disprove_confidence=int(row.get("disprove_confidence") or 0),
+                disprove_reasoning=row.get("disprove_reasoning"),
+                nationality_aligned=row.get("nationality_aligned"),
+                review_status=row.get("review_status") or "needs_review",
             )
         except Exception:
             continue
@@ -432,6 +687,12 @@ def _write_cache(subjects_and_findings: list[tuple[Subject, AListerFinding]]) ->
             "summary": f.summary,
             "reasoning": f.reasoning,
             "evidence_urls": f.evidence_urls or [],
+            "photo_url": f.photo_url,
+            "disprove_confidence": f.disprove_confidence,
+            "disprove_reasoning": f.disprove_reasoning,
+            "nationality_aligned": f.nationality_aligned,
+            "review_status": f.review_status,
+            "schema_version": SCHEMA_VERSION,
             "researched_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         })
     if not rows:
@@ -573,6 +834,11 @@ def persist_findings(
             "category": f.category,
             "summary": f.summary,
             "evidence_urls": f.evidence_urls or [],
+            "photo_url": f.photo_url,
+            "disprove_confidence": f.disprove_confidence,
+            "disprove_reasoning": f.disprove_reasoning,
+            "nationality_aligned": f.nationality_aligned,
+            "review_status": f.review_status,
         })
 
     if not rows:
@@ -657,18 +923,27 @@ def main() -> int:
         )
     )
 
-    flagged = [(s, f) for s, f in findings if f.is_notable and f.confidence >= args.threshold]
+    flagged = [
+        (s, f) for s, f in findings
+        if f.is_notable and f.confidence >= args.threshold
+        and f.review_status in ("confirmed", "needs_review")
+    ]
     print(f"\nResult: {stats['cache_hits']} cache hits, {stats['researched']} newly researched, "
           f"{stats['errors']} errors, {len(flagged)} FLAGGED at ≥{args.threshold}")
 
     if flagged:
         print("\n── A-LISTER FINDINGS ──")
         for s, f in sorted(flagged, key=lambda sf: -sf[1].confidence):
-            print(f"\n  Room {s.room or '-'} — {f.matched_name} ({f.relationship}, conf {f.confidence})")
+            tier = "[CONFIRMED]" if f.review_status == "confirmed" else "[NEEDS REVIEW]"
+            print(f"\n  {tier} Room {s.room or '-'} — {f.matched_name} ({f.relationship}, conf {f.confidence}, disprove {f.disprove_confidence}, nat={f.nationality_aligned})")
             print(f"    Category: {f.category}")
             print(f"    {f.summary}")
+            if f.photo_url:
+                print(f"    Photo: {f.photo_url}")
             if f.reasoning:
                 print(f"    (why: {f.reasoning})")
+            if f.disprove_reasoning:
+                print(f"    (disprove: {f.disprove_reasoning})")
             for url in f.evidence_urls[:3]:
                 print(f"    → {url}")
 

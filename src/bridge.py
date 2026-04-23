@@ -105,6 +105,12 @@ def build_envelope(
             "category": f.get("category"),
             "summary": f.get("summary"),
             "evidence_urls": f.get("evidence_urls") or [],
+            # Phase-10 hardening fields
+            "photo_url": f.get("photo_url"),
+            "disprove_confidence": int(f.get("disprove_confidence") or 0),
+            "disprove_reasoning": f.get("disprove_reasoning"),
+            "nationality_aligned": f.get("nationality_aligned"),
+            "review_status": f.get("review_status") or "needs_review",
         }
 
     alister_findings = [
