@@ -1,12 +1,17 @@
 // analyze-idea — Lovable Cloud edge function.
 //
-// Fires when submit_idea RPC runs. Calls Claude Opus 4.7 with web_search to:
+// Fires when submit_idea RPC runs. Calls Lovable AI Gateway (Gemini 2.5 Pro)
+// to:
 //   * Categorise the submission (category + subcategory)
 //   * Assess severity + sentiment
 //   * Produce a 1-sentence summary
-//   * Suggest 3-5 industry good practices (with source URLs)
+//   * Suggest 3-5 industry good practices (citing source by name)
 //   * Suggest 3-5 concrete starting-point actions
 //   * Identify semantically-similar prior ideas (from a shortlist we pass in)
+//
+// Uses Lovable AI Gateway for cost efficiency (~60-80× cheaper than Opus).
+// Gemini 2.5 Pro via the gateway handles structured output + source-cited
+// good practices well; source_url is model-knowledge-based (no live search).
 //
 // Then:
 //   * Updates the ideas row with the AI analysis
@@ -20,8 +25,8 @@
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
-const MODEL = Deno.env.get("IDEAS_MODEL") ?? "claude-opus-4-7";
-const ANTHROPIC_VERSION = "2023-06-01";
+const MODEL = Deno.env.get("IDEAS_MODEL") ?? "google/gemini-2.5-pro";
+const LOVABLE_AI_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 
 Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
@@ -30,13 +35,13 @@ Deno.serve(async (req) => {
   const auth = req.headers.get("authorization") ?? "";
   if (!secret || auth !== `Bearer ${secret}`) return json({ error: "unauthorized" }, 401);
 
-  const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY");
+  const lovableKey   = Deno.env.get("LOVABLE_API_KEY");
   const resendKey    = Deno.env.get("RESEND_API_KEY");
   const fromAddress  = Deno.env.get("EMAIL_FROM") ?? "Daios Cove Flash <flash@daioshotels.com>";
   const dashboardUrl = Deno.env.get("DASHBOARD_URL") ?? "https://flashreport.daioscove.com";
   const supabaseUrl  = Deno.env.get("SUPABASE_URL");
   const serviceKey   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!anthropicKey) return json({ error: "ANTHROPIC_API_KEY not set" }, 500);
+  if (!lovableKey)   return json({ error: "LOVABLE_API_KEY not set" }, 500);
   if (!resendKey)    return json({ error: "RESEND_API_KEY not set" }, 500);
   if (!supabaseUrl || !serviceKey) return json({ error: "Supabase env missing" }, 500);
 
@@ -71,18 +76,18 @@ Deno.serve(async (req) => {
     .from("app_settings").select("value").eq("key", "ideas_committee_email").maybeSingle();
   const committeeEmail = ((cfg?.value as string) ?? "committee@daioscove.com").trim();
 
-  // ─── Ask Claude ──────────────────────────────────────────────────────────
+  // ─── Ask Lovable AI Gateway (Gemini 2.5 Pro) ─────────────────────────────
   let ai: AIResult | null = null;
   let aiErr: string | null = null;
   try {
-    ai = await runClaude({
-      apiKey: anthropicKey,
+    ai = await runLovableAI({
+      apiKey: lovableKey,
       idea: idea as IdeaRow,
       shortlist,
     });
   } catch (e) {
     aiErr = String((e as Error)?.message ?? e).slice(0, 500);
-    console.error("claude analysis failed:", aiErr);
+    console.error("AI analysis failed:", aiErr);
   }
 
   // ─── Persist AI fields (even on failure — record that we tried) ──────────
@@ -207,52 +212,45 @@ function tokenize(s: string): string[] {
 
 // ─── Claude call with web_search ────────────────────────────────────────────
 
-async function runClaude(opts: {
+async function runLovableAI(opts: {
   apiKey: string;
   idea: IdeaRow;
   shortlist: { id: string; subject: string; category: string | null; ai_summary: string | null }[];
 }): Promise<AIResult> {
-  const systemPrompt = SYSTEM_PROMPT;
   const userPrompt = buildUserPrompt(opts.idea, opts.shortlist);
 
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+  const resp = await fetch(LOVABLE_AI_URL, {
     method: "POST",
     headers: {
-      "x-api-key": opts.apiKey,
-      "anthropic-version": ANTHROPIC_VERSION,
-      "content-type": "application/json",
+      "Authorization": `Bearer ${opts.apiKey}`,
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: MODEL,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user",   content: userPrompt },
+      ],
+      // Force structured JSON output. Gemini via gateway honours this.
+      response_format: { type: "json_object" },
+      temperature: 0.3,
       max_tokens: 3000,
-      system: [
-        { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } },
-      ],
-      tools: [
-        { type: "web_search_20260209", name: "web_search", max_uses: 3 },
-      ],
-      thinking: { type: "adaptive" },
-      messages: [{ role: "user", content: userPrompt }],
     }),
   });
 
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`Anthropic ${resp.status}: ${text.slice(0, 400)}`);
+    throw new Error(`Lovable AI ${resp.status}: ${text.slice(0, 400)}`);
   }
 
-  const data = await resp.json() as { content: Array<{ type: string; text?: string }> };
-  // Use the last text block (after any web_search tool calls)
-  let lastText = "";
-  for (const block of data.content || []) {
-    if (block.type === "text" && typeof block.text === "string") {
-      lastText = block.text;
-    }
-  }
-  if (!lastText) throw new Error("no text in Claude response");
+  const data = await resp.json() as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = data.choices?.[0]?.message?.content ?? "";
+  if (!content) throw new Error("no content in Lovable AI response");
 
-  const parsed = parseJsonObject(lastText);
-  if (!parsed) throw new Error(`could not parse JSON: ${lastText.slice(0, 300)}`);
+  const parsed = parseJsonObject(content);
+  if (!parsed) throw new Error(`could not parse JSON: ${content.slice(0, 300)}`);
 
   return normalizeResult(parsed);
 }
@@ -284,10 +282,10 @@ For each submission, produce structured JSON with:
 
 5. summary — ONE sentence (<= 30 words) capturing the core of the submission.
 
-6. good_practices — 3 to 5 industry best practices relevant to this submission.
-   Use web_search to find published hospitality or operations sources when helpful.
-   Each item: { "title": "short bold phrase", "detail": "one sentence explaining the practice", "source_url": "optional URL to the source" }.
-   Prefer sources from: Cornell Hospitality, Hotel News Now, Skift, HVS, EHL Hospitality Insights, AHLA, reputable consulting firms.
+6. good_practices — 3 to 5 industry best practices relevant to this submission, drawn from your knowledge of the hospitality / operations literature.
+   Each item: { "title": "short bold phrase", "detail": "one sentence explaining the practice", "source_url": null }.
+   When you know a specific authoritative source by name, include it in the detail text (e.g. "Cornell Hospitality research shows…", "per the AHLA 2024 benchmark…"). Leave source_url as null — do not fabricate URLs.
+   Reference where appropriate: Cornell Hospitality, Hotel News Now, Skift, HVS, EHL Hospitality Insights, AHLA, Deloitte Hospitality, STR, McKinsey Travel & Hospitality.
 
 7. starting_points — 3 to 5 concrete first actions THIS specific hotel could take.
    Each item: { "title": "imperative verb phrase", "detail": "one sentence explaining what / who / where to start" }.
@@ -295,12 +293,12 @@ For each submission, produce structured JSON with:
 
 8. similar_idea_ids — from the shortlist of prior ideas provided in the user prompt, return the UUIDs of any that are genuinely on the same theme. Empty array if none match.
 
-9. evidence_urls — up to 3 source URLs you actually used from web_search.
+9. evidence_urls — leave as []. Live web search is not available in this mode.
 
 Rules:
-- Use web_search only when external good-practice research adds real value (1 to 3 queries, max_uses=3).
+- Never fabricate URLs. Only cite source names in detail text; leave source_url as null.
 - If the submission is too vague to analyse, set severity="low", sentiment="constructive", and populate good_practices with generic advice.
-- Return ONLY the JSON object. Start with "{" and end with "}". No preamble, no code fences, no trailing prose.
+- Output MUST be a single valid JSON object with exactly these keys. No preamble, no code fences, no trailing prose.
 
 JSON schema:
 {
@@ -309,10 +307,10 @@ JSON schema:
   "severity": "low" | "medium" | "high" | "critical",
   "sentiment": "positive" | "constructive" | "frustrated" | "urgent",
   "summary": string,
-  "good_practices": [{"title": string, "detail": string, "source_url": string | null}],
+  "good_practices": [{"title": string, "detail": string, "source_url": null}],
   "starting_points": [{"title": string, "detail": string}],
   "similar_idea_ids": string[],
-  "evidence_urls": string[]
+  "evidence_urls": []
 }`;
 
 function buildUserPrompt(
