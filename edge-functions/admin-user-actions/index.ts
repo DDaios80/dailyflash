@@ -1,6 +1,7 @@
 // admin-user-actions — Lovable Cloud edge function.
 //
 // Single endpoint for all admin lifecycle operations on users:
+//   * create_user          — create a single user + assign role + email credentials
 //   * reset_password       — send a set-password link via Resend
 //   * suspend              — set auth.users.banned_until
 //   * unsuspend            — clear banned_until
@@ -18,6 +19,12 @@
 //   POST /functions/v1/admin-user-actions
 //   Headers:  Authorization: Bearer <CALLER_JWT>
 //   Body: one of:
+//     { action: "create_user",
+//         email: string, full_name: string, role: text,
+//         phone?: string, password?: string,         // password auto-generated if absent
+//         send_credentials?: boolean,                // default true
+//         subject_template?: string, body_template?: string
+//     }
 //     { action: "reset_password",   target_user_id: uuid }
 //     { action: "suspend",          target_user_id: uuid, until?: ISO8601, reason?: string }
 //     { action: "unsuspend",        target_user_id: uuid }
@@ -62,6 +69,17 @@ Deno.serve(async (req) => {
 
   try {
     switch (action) {
+      case "create_user":
+        return await handleCreateUser({
+          supa, callerId: caller.user.id,
+          email: body.email, fullName: body.full_name, role: body.role,
+          phone: body.phone, password: body.password,
+          sendCredentials: body.send_credentials !== false,
+          subjectTemplate: body.subject_template,
+          bodyTemplate: body.body_template,
+          resendKey, fromAddress, dashboardUrl,
+        });
+
       case "reset_password":
         return await handleResetPassword({
           supa, callerId: caller.user.id, targetId: body.target_user_id,
@@ -146,6 +164,106 @@ async function logEvent(
 }
 
 // ─── Action handlers ───────────────────────────────────────────────────────
+
+async function handleCreateUser(opts: {
+  supa: any; callerId: string;
+  email: string; fullName: string; role: string;
+  phone?: string; password?: string;
+  sendCredentials: boolean;
+  subjectTemplate?: string; bodyTemplate?: string;
+  resendKey: string; fromAddress: string; dashboardUrl: string;
+}): Promise<Response> {
+  const email = String(opts.email ?? "").trim().toLowerCase();
+  const fullName = String(opts.fullName ?? "").trim();
+  const role = String(opts.role ?? "").trim();
+  const phone = String(opts.phone ?? "").trim();
+
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return json({ error: "valid email required" }, 400);
+  }
+  if (!fullName) return json({ error: "full_name required" }, 400);
+  if (!role)     return json({ error: "role required" }, 400);
+
+  // Password: use caller-provided if present and >=8 chars, else auto-generate.
+  const password = (opts.password && String(opts.password).length >= 8)
+    ? String(opts.password)
+    : generatePassword(16);
+
+  // Create the auth user. email_confirm=true so they can sign in without
+  // a confirmation-email round trip.
+  const { data: created, error: cErr } = await opts.supa.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    phone: phone || undefined,
+    user_metadata: { full_name: fullName, ...(phone ? { phone } : {}) },
+  });
+  if (cErr) {
+    const msg = cErr.message ?? String(cErr);
+    if (/already (been )?registered|already exists|duplicate/i.test(msg)) {
+      return json({ error: "a user with this email already exists" }, 409);
+    }
+    return json({ error: "createUser failed: " + msg }, 502);
+  }
+  const newUserId = created?.user?.id;
+  if (!newUserId) return json({ error: "createUser returned no id" }, 502);
+
+  // Assign role
+  const { error: rErr } = await opts.supa
+    .from("user_roles")
+    .upsert({ user_id: newUserId, role }, { onConflict: "user_id" });
+  if (rErr) {
+    // Roll back the auth user so we don't leave an orphan with no role.
+    await opts.supa.auth.admin.deleteUser(newUserId).catch(() => {});
+    return json({ error: "role assignment failed: " + rErr.message }, 502);
+  }
+
+  // Email the credentials if asked (default true)
+  let messageId: string | null = null;
+  let emailStatus: "sent" | "failed" | "skipped" = "skipped";
+  let emailError: string | null = null;
+
+  if (opts.sendCredentials) {
+    const subjectTpl = opts.subjectTemplate
+      || "Your Daios Cove Flash Report access";
+    const bodyTpl = opts.bodyTemplate || DEFAULT_WELCOME_BODY;
+    const subject = renderTemplate(subjectTpl, {
+      email, password, name: fullName, dashboard: opts.dashboardUrl,
+    });
+    const renderedBody = renderTemplate(bodyTpl, {
+      email, password, name: fullName, dashboard: opts.dashboardUrl,
+    });
+    const html = renderCredentialsEmail(renderedBody, opts.dashboardUrl);
+
+    try {
+      messageId = await sendViaResend({
+        apiKey: opts.resendKey, from: opts.fromAddress, to: email, subject, html,
+      });
+      emailStatus = "sent";
+    } catch (e) {
+      emailStatus = "failed";
+      emailError = String((e as Error)?.message ?? e).slice(0, 500);
+    }
+  }
+
+  await logEvent(opts.supa, opts.callerId, newUserId, "create_user", {
+    email, full_name: fullName, role, phone: phone || null,
+    password_generated: !opts.password,
+    email_status: emailStatus,
+    resend_message_id: messageId,
+    email_error: emailError,
+  });
+
+  return json({
+    ok: true,
+    user_id: newUserId,
+    email,
+    role,
+    email_status: emailStatus,
+    resend_message_id: messageId,
+    ...(emailError ? { email_error: emailError } : {}),
+  });
+}
 
 async function handleResetPassword(opts: {
   supa: any; callerId: string; targetId: string;
@@ -353,6 +471,34 @@ async function handleCredentialsBatch(opts: {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+// Default template used when the admin creates a user without supplying
+// their own body copy. Kept short and professional.
+const DEFAULT_WELCOME_BODY = `Hello {name},
+
+Your Daios Cove Flash Report account has been created.
+
+  Email:    {email}
+  Password: {password}
+
+Please sign in and change your password on first login.
+
+Dashboard: {dashboard}`;
+
+function generatePassword(len: number): string {
+  // Mixed character set excluding look-alikes (0, O, 1, l, I).
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ" +
+                "abcdefghijkmnopqrstuvwxyz" +
+                "23456789" +
+                "!@#$%^&*-_=+";
+  const out: string[] = [];
+  const buf = new Uint32Array(len);
+  crypto.getRandomValues(buf);
+  for (let i = 0; i < len; i++) {
+    out.push(chars[buf[i] % chars.length]);
+  }
+  return out.join("");
+}
 
 function computeBanDuration(untilIso: string): string {
   // Supabase expects a duration string like "24h" or "720h".
