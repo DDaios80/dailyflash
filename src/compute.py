@@ -84,6 +84,25 @@ NOTABLE_AGENT_KEYWORDS = (
 )
 
 
+# Booking.com bookings are flagged in their own Flash Report section so
+# teams can give them exceptional service — the goal is raising our
+# Booking.com rating from 8.7 to 9.2+ (the "Excellent" threshold). In the
+# Opera export, these bookings carry travel_agent_name = "BOOKING" (1268
+# reservations in our data) or "BOOK" (53 — variant label).
+BOOKING_COM_TRAVEL_AGENTS = ("BOOKING", "BOOK")
+
+
+def is_booking_com(r: dict[str, Any]) -> bool:
+    ta = (r.get("travel_agent_name") or "").strip().upper()
+    if not ta:
+        return False
+    if ta in BOOKING_COM_TRAVEL_AGENTS:
+        return True
+    if "BOOKING.COM" in ta:
+        return True
+    return False
+
+
 def is_complimentary(r: dict[str, Any]) -> bool:
     if (r.get("complimentary_yn") or "").upper() == "Y":
         return True
@@ -263,6 +282,7 @@ class DailyFlash:
     special_attention_departures: list[dict[str, Any]] = field(default_factory=list)
     complimentary_partner_arrivals: list[dict[str, Any]] = field(default_factory=list)
     pep_arrivals: list[dict[str, Any]] = field(default_factory=list)
+    booking_com_arrivals: list[dict[str, Any]] = field(default_factory=list)
     birthdays_today: list[dict[str, Any]] = field(default_factory=list)
     allergies_in_house: list[dict[str, Any]] = field(default_factory=list)
 
@@ -337,6 +357,10 @@ def compute_flash(
 
     pep_arrivals = [_guest_payload(r) for r in arrivals if is_pep(r)]
 
+    booking_com_arrivals = [
+        _guest_payload(r) for r in arrivals if is_booking_com(r)
+    ]
+
     birthdays = [
         _guest_payload(r)
         for r in in_house
@@ -366,6 +390,7 @@ def compute_flash(
         special_attention_departures=_by_room(special_departures),
         complimentary_partner_arrivals=_by_room(complimentary_partner_arrivals),
         pep_arrivals=_by_room(pep_arrivals),
+        booking_com_arrivals=_by_room(booking_com_arrivals),
         birthdays_today=birthdays,
         allergies_in_house=_by_room(allergies_in_house),
     )

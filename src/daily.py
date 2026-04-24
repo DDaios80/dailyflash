@@ -175,6 +175,7 @@ def assemble_payload_in_memory(
         "special_attention_departures": _enrich(flash.special_attention_departures),
         "complimentary_partner_arrivals": _enrich(flash.complimentary_partner_arrivals),
         "pep_arrivals": _enrich(flash.pep_arrivals),
+        "booking_com_arrivals": _enrich(flash.booking_com_arrivals),
         "birthdays_in_house": (
             birthdays_override if birthdays_override is not None
             else _enrich(flash.birthdays_today)
