@@ -173,18 +173,17 @@ interface Chair { user_id: string; email: string; name: string; }
 // ─── Chair loading ──────────────────────────────────────────────────────────
 
 async function loadChair(supa: any): Promise<Chair | null> {
-  const { data: s } = await supa
-    .from("app_settings").select("value")
-    .eq("key", "committee_chair_user_id").maybeSingle();
-  if (!s?.value) return null;
-  const { data: u } = await supa.auth.admin.getUserById(s.value);
-  if (!u?.user?.email) return null;
+  // Phase 21 — use the rotating-roster RPC. Honours per-week overrides
+  // and falls back to the legacy committee_chair_user_id app setting
+  // when the roster is empty.
+  const { data, error } = await supa.rpc("current_committee_chair");
+  if (error || !Array.isArray(data) || data.length === 0) return null;
+  const row = data[0];
+  if (!row?.user_id || !row?.email) return null;
   return {
-    user_id: s.value,
-    email: u.user.email,
-    name: (u.user.user_metadata?.full_name
-      || u.user.user_metadata?.name
-      || u.user.email) as string,
+    user_id: row.user_id,
+    email: row.email,
+    name: row.display_name || row.email,
   };
 }
 
