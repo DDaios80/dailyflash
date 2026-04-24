@@ -164,13 +164,13 @@ grant execute on function current_committee_chair() to authenticated;
 -- ─── Upcoming schedule view (super-admin UI) ────────────────────────────
 create or replace function excom_rotation_upcoming(p_weeks int default 12)
   returns table (
-    week_monday  date,
-    iso_week     text,
-    user_id      uuid,
-    email        text,
-    display_name text,
-    position     int,
-    is_override  boolean,
+    week_monday     date,
+    iso_week        text,
+    user_id         uuid,
+    email           text,
+    display_name    text,
+    roster_position int,
+    is_override     boolean,
     override_reason text
   )
   language plpgsql stable security definer set search_path = public, auth
@@ -205,7 +205,7 @@ begin
       (u.raw_user_meta_data->>'name'),
       u.email
     ) as display_name,
-    rot.position,
+    rot.position as roster_position,
     (r.override_uid is not null) as is_override,
     r.override_reason
   from resolved r
