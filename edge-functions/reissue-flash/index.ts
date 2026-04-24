@@ -26,7 +26,18 @@
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Max-Age": "86400",
+};
+
 Deno.serve(async (req) => {
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
@@ -232,6 +243,6 @@ async function safeJson(r: Response): Promise<any> {
 function json(p: unknown, s = 200): Response {
   return new Response(JSON.stringify(p), {
     status: s,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...CORS_HEADERS },
   });
 }
