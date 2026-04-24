@@ -62,7 +62,7 @@ begin
   insert into user_achievements (user_id, milestone_key, unlocked_at)
   select distinct ae.actor_user_id, 'committee_member', min(ae.created_at)
   from admin_user_events ae
-  where ae.action = 'committee_update'
+  where ae.action::text = 'committee_update'
   group by ae.actor_user_id
   on conflict do nothing;
 
