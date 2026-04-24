@@ -1,0 +1,32 @@
+# Railway config for the Phase 23 reissue webhook service.
+#
+# HOW TO USE
+# ──────────
+# Railway services use railway.toml at the repo root by default. For a
+# SECOND service from the same repo, use the Railway dashboard:
+#
+#   1. Railway project → New Service → "Empty Service"
+#   2. Settings → Source → connect to DDaios80/dailyflash, branch: main
+#   3. Settings → Config-as-code → set path to `railway.webhook.toml`
+#      (OR leave as default and override the Start Command in the UI)
+#   4. Variables → copy all env from the cron service (SUPABASE_URL,
+#      SUPABASE_SERVICE_ROLE_KEY, ANTHROPIC_API_KEY, MSGRAPH_* tokens,
+#      PIPELINE_SECRET, DAILY_FLASH_TMP, etc.)
+#   5. Settings → Networking → Generate Domain
+#        Copy the domain (e.g. dailyflash-webhook.up.railway.app)
+#        Store it as cron_private.secrets.reissue_webhook_url in Supabase
+#        (pointing at https://<domain>/reissue)
+#
+# Deploy is long-running (uvicorn), not a cron. restartPolicyType must be
+# ON_FAILURE so Railway relaunches it if it crashes.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "uvicorn src.webhook:app --host 0.0.0.0 --port $PORT"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 30

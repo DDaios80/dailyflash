@@ -6,3 +6,6 @@ supabase>=2.7
 anthropic>=0.88.0
 pydantic>=2.7
 requests>=2.31
+# Phase 23 — reissue webhook (separate Railway service)
+fastapi>=0.115
+uvicorn[standard]>=0.32
