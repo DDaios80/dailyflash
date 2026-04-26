@@ -6,8 +6,11 @@ payload. The Python pipeline does NOT ingest Zoho data; that's owned
 by the edge function. This module is purely the read side.
 
 Buckets returned:
-  - allergies:           note_kind = 'allergy'
-  - medical:             note_kind = 'medical'
+  - allergies:           source_type IN ('allergies','all_notes') — file-level
+                         signal so we don't depend on the AI categorizer
+                         (note_kind/category_slug are NULL until categorization
+                         lands).
+  - medical:             source_type = 'medical_notes'
   - pending_complaints:  source_type = 'pending_complaints', resolved_at IS NULL
   - boat_trips:          source_type = ZOHO_EXCURSIONS_SOURCE_TYPE, note_date = report_date
   - hsk_orders:          source_type = 'housekeeping_notes', last 24h
@@ -67,19 +70,24 @@ def fetch_zoho_for_report(report_date: date) -> dict[str, list[dict]]:
 
     out: dict[str, list[dict]] = {}
 
-    # 1. Allergies — note_kind=allergy. No date filter; allergy notes persist
-    #    for the whole stay. In-house filter happens at merge time.
+    # 1. Allergies — file-level filter on source_type so we don't depend on
+    #    the AI categorizer (which currently runs but persists nothing).
+    #    Includes both the dedicated allergy file and all_notes (which has
+    #    food_allergy_alert + generic_allergy_alert columns).
     out["allergies"] = (
-        _q("zoho_notes", note_kind="eq.allergy")
+        sb.from_("zoho_notes").select(_SELECT_FIELDS)
+        .in_("source_type", ["allergies", "all_notes"])
         .order("note_created_at", desc=True)
         .limit(500)
         .execute()
         .data or []
     )
 
-    # 2. Medical — note_kind=medical. Same logic as allergies.
+    # 2. Medical — file-level filter (every row in the medical_notes file
+    #    is medical regardless of categorizer state).
     out["medical"] = (
-        _q("zoho_notes", note_kind="eq.medical")
+        sb.from_("zoho_notes").select(_SELECT_FIELDS)
+        .eq("source_type", "medical_notes")
         .order("note_created_at", desc=True)
         .limit(200)
         .execute()
