@@ -21,9 +21,9 @@ from typing import Any
 from supa import client as supa_client
 
 
-# Confirm with admin: the enum value the boat-trips file is mapped to.
-# Defaults to 'boat_trips'. Override via env if Lovable used a different label.
-ZOHO_BOAT_SOURCE_TYPE = os.environ.get("ZOHO_BOAT_SOURCE_TYPE", "boat_trips")
+# The Lovable-side enum value the AroundTheCove RIB Boat file is mapped to.
+# Confirmed with admin 26 Apr 2026.
+ZOHO_BOAT_SOURCE_TYPE = os.environ.get("ZOHO_BOAT_SOURCE_TYPE", "around_the_cove")
 
 
 _SELECT_FIELDS = (
