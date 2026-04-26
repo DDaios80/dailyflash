@@ -29,7 +29,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from ingest import parse_file
-from compute import compute_flash
+from compute import compute_flash, _in_house_on
 from alister import (
     subjects_from_reservation,
     research_subjects,
@@ -150,6 +150,12 @@ def assemble_payload_in_memory(
             if not f.get("is_notable") or (f.get("confidence") or 0) < 85:
                 continue
             rec = rec_by_rnid.get(rnid) or {}
+            # Phase 23.1: defensive in-house filter. The reservation must
+            # actually overlap the report_date — protects against findings
+            # for guests whose stay ended before today's flash, or whose
+            # reservation was cancelled/edited after research.
+            if not _in_house_on(rec, report_date):
+                continue
             guest = f"{(rec.get('guest_first_name') or '').strip()} {(rec.get('guest_name') or '').strip()}".strip()
             al_panel_rows.append({
                 **f,
