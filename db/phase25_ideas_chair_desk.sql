@@ -36,8 +36,13 @@ alter table ideas
   add column if not exists csat_comment           text,
   add column if not exists csat_at                timestamptz;
 
+-- NB: predicate uses for_monday_at IS NOT NULL rather than
+-- status = 'for_monday' to avoid the "unsafe use of new enum value"
+-- error when this migration runs in a single transaction (Postgres
+-- requires new enum values to be committed before DDL can reference
+-- them).
 create index if not exists ideas_for_monday_idx
-  on ideas (monday_meeting_date) where status = 'for_monday';
+  on ideas (monday_meeting_date) where for_monday_at is not null;
 
 create index if not exists ideas_acknowledged_idx
   on ideas (acknowledged_at desc) where acknowledged_at is not null;
