@@ -21,9 +21,9 @@ from typing import Any
 from supa import client as supa_client
 
 
-# The Lovable-side enum value the AroundTheCove RIB Boat file is mapped to.
-# Confirmed with admin 26 Apr 2026.
-ZOHO_BOAT_SOURCE_TYPE = os.environ.get("ZOHO_BOAT_SOURCE_TYPE", "around_the_cove")
+# The Lovable-side enum value covering activity reports (RIB boat trips
+# and any future excursion-type reports). Confirmed with admin 26 Apr 2026.
+ZOHO_BOAT_SOURCE_TYPE = os.environ.get("ZOHO_BOAT_SOURCE_TYPE", "excursions")
 
 
 _SELECT_FIELDS = (
