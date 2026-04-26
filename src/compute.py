@@ -431,14 +431,19 @@ def merge_zoho_into_flash(
         _room_int(r.get("room")) for r in in_house if r.get("room")
     }
     rooms_in_house.discard(None)
-    confirmations = {
-        (r.get("confirmation_no") or "").strip(): r
-        for r in in_house
-        if r.get("confirmation_no")
-    }
+    # Cast to str defensively — Opera xlsx may parse confirmation_no as
+    # numeric, in which case .strip() would AttributeError on a float.
+    confirmations: dict[str, dict] = {}
+    for r in in_house:
+        cn = r.get("confirmation_no")
+        if cn is None:
+            continue
+        cn_str = str(cn).strip()
+        if cn_str:
+            confirmations[cn_str] = r
 
     def _is_in_house(note: dict) -> bool:
-        ref = (note.get("reservation_ref") or "").strip()
+        ref = str(note.get("reservation_ref") or "").strip()
         if ref and ref in confirmations:
             return True
         rn = _room_int(note.get("room"))
