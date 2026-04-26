@@ -394,3 +394,84 @@ def compute_flash(
         birthdays_today=birthdays,
         allergies_in_house=_by_room(allergies_in_house),
     )
+
+
+# ─── Phase 24: zoho merge ────────────────────────────────────────────────
+# Bucketise zoho_notes (already populated by ingest-zoho-notes) into
+# payload sections, filtered to guests who are in-house on report_date.
+# Match guest by reservation_ref (confirmation_no) when present, fall back
+# to room number (raw int extracted from reservations.room).
+
+import re
+from collections import Counter, defaultdict
+
+
+_ROOM_INT_RE = re.compile(r"^\s*(\d+)")
+
+
+def _room_int(s: Any) -> str | None:
+    if s is None:
+        return None
+    m = _ROOM_INT_RE.match(str(s))
+    return m.group(1) if m else None
+
+
+def merge_zoho_into_flash(
+    records: list[dict[str, Any]],
+    zoho: dict[str, list[dict]],
+    report_date: date,
+) -> dict[str, Any]:
+    """Compute the new payload sections from zoho_notes buckets.
+
+    `records` are the parsed Opera reservations rows. `zoho` is the dict
+    returned by zoho_fetch.fetch_zoho_for_report.
+    """
+    in_house = [r for r in records if _in_house_on(r, report_date)]
+    rooms_in_house = {
+        _room_int(r.get("room")) for r in in_house if r.get("room")
+    }
+    rooms_in_house.discard(None)
+    confirmations = {
+        (r.get("confirmation_no") or "").strip(): r
+        for r in in_house
+        if r.get("confirmation_no")
+    }
+
+    def _is_in_house(note: dict) -> bool:
+        ref = (note.get("reservation_ref") or "").strip()
+        if ref and ref in confirmations:
+            return True
+        rn = _room_int(note.get("room"))
+        return bool(rn and rn in rooms_in_house)
+
+    def _bucket(key: str) -> list[dict]:
+        return [n for n in (zoho.get(key) or []) if _is_in_house(n)]
+
+    # HSK aggregation: count + top items per room (in-house only).
+    hsk_in_house = _bucket("hsk_orders")
+    by_room: dict[str, list[dict]] = defaultdict(list)
+    for n in hsk_in_house:
+        rn = _room_int(n.get("room"))
+        if rn:
+            by_room[rn].append(n)
+    hsk_summary = []
+    for rn, items in by_room.items():
+        names: Counter = Counter()
+        for it in items:
+            label = (it.get("subject") or it.get("body") or "")[:60].strip()
+            if label:
+                names[label] += 1
+        hsk_summary.append({
+            "room": rn,
+            "count": len(items),
+            "top_items": [{"item": k, "qty": v} for k, v in names.most_common(5)],
+        })
+    hsk_summary.sort(key=lambda x: -x["count"])
+
+    return {
+        "zoho_allergies":          _bucket("allergies"),
+        "zoho_medical_notes":      _bucket("medical"),
+        "zoho_pending_complaints": _bucket("pending_complaints"),
+        "zoho_todays_activities":  list(zoho.get("boat_trips") or []),  # date already filtered
+        "zoho_hsk_summary":        hsk_summary[:50],
+    }

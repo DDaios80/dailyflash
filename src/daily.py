@@ -29,7 +29,8 @@ from typing import Any
 from dotenv import load_dotenv
 
 from ingest import parse_file
-from compute import compute_flash, _in_house_on
+from compute import compute_flash, _in_house_on, merge_zoho_into_flash
+from zoho_fetch import fetch_zoho_for_report, size_summary as zoho_size_summary
 from alister import (
     subjects_from_reservation,
     research_subjects,
@@ -117,15 +118,20 @@ def assemble_payload_in_memory(
     daily_briefing: dict | None = None,
     pool_heating: list[dict] | None = None,
     birthdays_override: list[dict] | None = None,
+    zoho_data: dict[str, list[dict]] | None = None,
 ) -> dict:
     """Build the flash_reports.payload from in-memory data (no DB query).
 
     If `birthdays_override` is provided (from the comprehensive OneDrive
     birthdays file), it replaces the Opera-reservations-derived
     birthdays_today list from compute_flash.
+
+    If `zoho_data` is provided (from zoho_fetch.fetch_zoho_for_report),
+    Phase 24 zoho payload sections are computed and added.
     """
     promoted_rooms = promoted_rooms or set()
     flash = compute_flash(records, report_date, promoted_rooms=promoted_rooms)
+    zoho_payload = merge_zoho_into_flash(records, zoho_data or {}, report_date)
 
     def _enrich(guests: list[dict]) -> list[dict]:
         out = []
@@ -197,7 +203,17 @@ def assemble_payload_in_memory(
             "extractions": len(extractions_by_rnid),
             "alister_researched": all_alister_count,
             "alister_notable": len(al_panel_rows),
+            "zoho_allergies": len(zoho_payload["zoho_allergies"]),
+            "zoho_medical": len(zoho_payload["zoho_medical_notes"]),
+            "zoho_pending_complaints": len(zoho_payload["zoho_pending_complaints"]),
+            "zoho_activities": len(zoho_payload["zoho_todays_activities"]),
         },
+        # Phase 24 — zoho_notes-sourced payload sections
+        "zoho_allergies":          zoho_payload["zoho_allergies"],
+        "zoho_medical_notes":      zoho_payload["zoho_medical_notes"],
+        "zoho_pending_complaints": zoho_payload["zoho_pending_complaints"],
+        "zoho_todays_activities":  zoho_payload["zoho_todays_activities"],
+        "zoho_hsk_summary":        zoho_payload["zoho_hsk_summary"],
     }
 
 
@@ -267,11 +283,21 @@ def run_daily(
     weather = fetch_weather(report_date, days=3)
     print(f"[4/5] Weather: {len(weather or [])} days")
 
+    # Step 4b — Phase 24: zoho_notes pulled by Lovable's ingest-zoho-notes
+    # edge function. We just SELECT and bucket, no ingestion here.
+    try:
+        zoho_data = fetch_zoho_for_report(report_date)
+        print(f"[4b/5] Zoho buckets: {zoho_size_summary(zoho_data)}")
+    except Exception as e:
+        print(f"[4b/5] zoho fetch failed (continuing without it): {e}")
+        zoho_data = {}
+
     # Step 5 — assemble + build envelope + POST
     flash_report_payload = assemble_payload_in_memory(
         records, extractions_by_rnid, findings_by_rnid,
         report_date, weather,
         birthdays_override=birthdays_override,
+        zoho_data=zoho_data,
     )
     envelope = build_envelope(
         report_date=report_date,
