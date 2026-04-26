@@ -9,7 +9,7 @@ Buckets returned:
   - allergies:           note_kind = 'allergy'
   - medical:             note_kind = 'medical'
   - pending_complaints:  source_type = 'pending_complaints', resolved_at IS NULL
-  - boat_trips:          source_type = ZOHO_BOAT_SOURCE_TYPE, note_date = report_date
+  - boat_trips:          source_type = ZOHO_EXCURSIONS_SOURCE_TYPE, note_date = report_date
   - hsk_orders:          source_type = 'housekeeping_notes', last 24h
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ from supa import client as supa_client
 
 # The Lovable-side enum value covering activity reports (RIB boat trips
 # and any future excursion-type reports). Confirmed with admin 26 Apr 2026.
-ZOHO_BOAT_SOURCE_TYPE = os.environ.get("ZOHO_BOAT_SOURCE_TYPE", "excursions")
+ZOHO_EXCURSIONS_SOURCE_TYPE = os.environ.get("ZOHO_EXCURSIONS_SOURCE_TYPE", "excursions")
 
 
 _SELECT_FIELDS = (
@@ -100,7 +100,7 @@ def fetch_zoho_for_report(report_date: date) -> dict[str, list[dict]]:
     # 4. Boat trips for today — note_date = report_date.
     out["boat_trips"] = (
         sb.from_("zoho_notes").select(_SELECT_FIELDS)
-        .eq("source_type", ZOHO_BOAT_SOURCE_TYPE)
+        .eq("source_type", ZOHO_EXCURSIONS_SOURCE_TYPE)
         .eq("note_date", rd_iso)
         .order("note_created_at", desc=False)
         .limit(100)
