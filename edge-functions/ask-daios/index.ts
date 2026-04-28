@@ -63,6 +63,23 @@ Deno.serve(async (req) => {
   const language: "en" | "el" = body?.language === "el" ? "el" : "en";
   const client: string = body?.client === "voice" ? "voice" : "web";
 
+  // Phase 26.5 — conversation memory. The frontend keeps the last N
+  // turns client-side and passes them as `history` on each new question.
+  // Cap at last 10 entries (5 user + 5 assistant) to keep the input
+  // token count bounded; older turns drop off naturally.
+  const rawHistory = Array.isArray(body?.history) ? body.history : [];
+  const history: Array<{ role: "user" | "assistant"; content: string }> = rawHistory
+    .filter((t: any) => t && (t.role === "user" || t.role === "assistant") && typeof t.content === "string")
+    .slice(-10)
+    .map((t: any) => ({ role: t.role, content: t.content.toString().slice(0, 5000) }));
+
+  // conversation_id ties multiple turns to one drawer session. Optional —
+  // frontend may or may not pass it.
+  const conversationId: string | null =
+    typeof body?.conversation_id === "string" && body.conversation_id.length === 36
+      ? body.conversation_id
+      : null;
+
   if (!question || question.length > 5000) {
     return json({ ok: false, error: "question must be 1-5000 chars" }, 400);
   }
@@ -116,7 +133,13 @@ Deno.serve(async (req) => {
           cache_control: { type: "ephemeral" },
         },
       ],
-      messages: [{ role: "user", content: question }],
+      // Phase 26.5: history first, then the new question. Lets the model
+      // resolve follow-ups like "And tomorrow?" or "Tell me more about
+      // that room" against the prior turn.
+      messages: [
+        ...history,
+        { role: "user", content: question },
+      ],
     });
 
     answer = res.content
@@ -154,6 +177,7 @@ Deno.serve(async (req) => {
       latency_ms: latencyMs,
       model: MODEL,
       client,
+      conversation_id: conversationId,
       error: errorMsg,
     })
     .select("id")
@@ -316,6 +340,7 @@ Voice you must use:
 - Never speculate. If the data doesn't contain the answer, say "I don't have that information for tonight" or equivalent.
 - Don't repeat the question back to the user.
 - Don't mention "data" or "context" — speak as if you naturally know.
+- Follow-ups: when the user has just asked a question and asks a related follow-up ("And tomorrow?", "Tell me more about that room", "What's the room number?"), use the prior turn for context. Don't make the user repeat themselves.
 - Don't recommend, don't add commentary. Just the facts. (Exception: if the user explicitly asks "what should we do".)
 
 Privacy and PII:
