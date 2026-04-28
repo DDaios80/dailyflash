@@ -1,15 +1,20 @@
-// ask-daios — Phase 26.1
+// ask-daios — Phase 26.1 (+ Phase 27 graph tools)
 //
 // Text-only Q&A backend for the "Ask Daios" assistant. Caller passes a
 // question + their JWT. We:
 //   1. Verify the JWT, get user_id + role
 //   2. Pull today's flash_reports.payload + role-gated zoho_notes
 //   3. Call Claude Opus 4.7 with system prompt + cached context
-//   4. Log the Q&A to daios_qa_log
-//   5. Return the answer
+//      + tool definitions for cross-cutting graph queries (Phase 27)
+//   4. Run the tool-use loop until Claude has all it needs
+//   5. Log the Q&A to daios_qa_log
+//   6. Return the answer
 //
 // Voice (26.2) wraps this with browser SpeechRecognition + SpeechSynthesis.
 // ElevenLabs upgrade (26.3) replaces the TTS layer.
+// Phase 27 — adds graph_* RPCs as tools so the assistant can answer
+// "Has X stayed before?", "Which rooms have recurring complaints?",
+// "Which TAs bring the most A-listers?", etc.
 //
 // Contract:
 //   POST /functions/v1/ask-daios
@@ -121,36 +126,66 @@ Deno.serve(async (req) => {
 
     // ── Call Claude with prompt cache on system + context ──────────────
     const anthropic = new Anthropic({ apiKey: anthropicKey });
+    const tools = graphTools(userRole);
 
-    const res = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 600,
-      system: [
-        { type: "text", text: sys, cache_control: { type: "ephemeral" } },
-        {
-          type: "text",
-          text: `\n\n=== Today's data ===\n${contextJson}\n=== End of data ===`,
-          cache_control: { type: "ephemeral" },
-        },
-      ],
-      // Phase 26.5: history first, then the new question. Lets the model
-      // resolve follow-ups like "And tomorrow?" or "Tell me more about
-      // that room" against the prior turn.
-      messages: [
-        ...history,
-        { role: "user", content: question },
-      ],
-    });
+    // Phase 27 — tool-use loop. Cap at 4 rounds total (most questions
+    // resolve in 0-1 tool calls; 4 is a safety net so a runaway plan
+    // can't burn the budget).
+    const messages: any[] = [
+      ...history,
+      { role: "user", content: question },
+    ];
 
-    answer = res.content
+    let toolRounds = 0;
+    const maxRounds = 4;
+    let res: any;
+    while (true) {
+      res = await anthropic.messages.create({
+        model: MODEL,
+        max_tokens: 600,
+        tools,
+        system: [
+          { type: "text", text: sys, cache_control: { type: "ephemeral" } },
+          {
+            type: "text",
+            text: `\n\n=== Today's data ===\n${contextJson}\n=== End of data ===`,
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        messages,
+      });
+
+      // Aggregate token usage across all rounds.
+      promptTokens     += res.usage?.input_tokens ?? 0;
+      completionTokens += res.usage?.output_tokens ?? 0;
+      cacheReadTokens  += (res.usage as any)?.cache_read_input_tokens ?? 0;
+
+      const toolUses = (res.content ?? []).filter((b: any) => b.type === "tool_use");
+      if (toolUses.length === 0 || res.stop_reason !== "tool_use" || toolRounds >= maxRounds) {
+        break;
+      }
+
+      // Execute each tool call against Postgres and feed results back.
+      messages.push({ role: "assistant", content: res.content });
+      const toolResults: any[] = [];
+      for (const tu of toolUses) {
+        const result = await runGraphTool(supa, tu.name, tu.input ?? {});
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: JSON.stringify(result).slice(0, 30000),
+        });
+      }
+      messages.push({ role: "user", content: toolResults });
+      toolRounds += 1;
+    }
+
+    answer = (res.content ?? [])
       .filter((b: any) => b.type === "text")
       .map((b: any) => b.text)
       .join("")
       .trim();
 
-    promptTokens     = res.usage?.input_tokens ?? 0;
-    completionTokens = res.usage?.output_tokens ?? 0;
-    cacheReadTokens  = (res.usage as any)?.cache_read_input_tokens ?? 0;
     costUsd = estimateCost({ promptTokens, completionTokens, cacheReadTokens });
   } catch (e) {
     errorMsg = String((e as Error)?.message ?? e).slice(0, 1000);
@@ -364,6 +399,12 @@ Topics you SHOULD answer (these are operational, even if they sound general):
 - Booking.com rating, channels, partner arrivals
 - Ideas / opinions / feedback queue
 - Anything that appears in the data block above
+- Cross-cutting / historical questions ("Has Tijen stayed before?", "Does room 537 have recurring complaints?", "Which travel agents bring the most A-listers?", "Who are our returning A-listers?") — call the matching tool, then answer with the result.
+
+Tool use:
+- Today's data above answers most questions. Don't call a tool if the answer is already in the data block.
+- For cross-stay history, room patterns, travel agent metrics, or A-lister loyalty — call the tool. One call per question is usually enough.
+- If a tool returns no rows, say "I don't have a record of that" and stop. Don't speculate.
 
 Topics you should DECLINE (these are outside resort ops):
 - General knowledge ("when did Crete become Greek?")
@@ -373,6 +414,163 @@ Topics you should DECLINE (these are outside resort ops):
 - Programming or technical questions
 
 If declining, be brief: "I'm focused on today at the Cove" — once, no preamble.`;
+}
+
+
+// ─── Phase 27 — graph tools ──────────────────────────────────────────────
+// Anthropic tool definitions backed by graph_* RPCs. Role-gated so e.g.
+// general staff can't surface A-lister loyalty lists.
+
+function graphTools(userRole: string): any[] {
+  const seeAlister = ["admin", "management", "guest_relations"].includes(userRole);
+  const seeService = canSeeServiceNotes(userRole);
+
+  const tools: any[] = [];
+
+  // Anyone in service can ask about guest history (no PII beyond what
+  // the role can already see in zoho_notes and reservations).
+  if (seeService) {
+    tools.push({
+      name: "guest_history",
+      description:
+        "Look up past stays for a guest by name. Use this when the user asks 'has X stayed before?', 'when did X last visit?', 'is X a returning guest?'. Returns up to 5 matching guests with stay counts, first/last stay dates, channels, and travel agents.",
+      input_schema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Guest name (full or partial)" },
+          country: { type: "string", description: "Optional country filter to disambiguate common names" },
+        },
+        required: ["name"],
+      },
+    });
+
+    tools.push({
+      name: "room_complaints",
+      description:
+        "Get complaint history for a specific room. Use when the user asks 'has room X had problems?', 'how many complaints for room X?', 'what's wrong with room X?'. Returns count, distinct guest count, average resolution time, and the 10 most recent complaints.",
+      input_schema: {
+        type: "object",
+        properties: {
+          room: { type: "string", description: "Room number, e.g. '537'" },
+          days: { type: "integer", description: "Lookback window in days, default 90", default: 90 },
+        },
+        required: ["room"],
+      },
+    });
+
+    tools.push({
+      name: "ta_overview",
+      description:
+        "Get travel agent quality metrics. Use when the user asks 'how is travel agent X performing?', 'how many bookings did TA X bring?', 'what's the A-lister rate from X?'. Returns stays, A-lister stays, allergy stays, VIP stays, and average length of stay.",
+      input_schema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Travel agent name (full or partial)" },
+          days: { type: "integer", description: "Lookback window in days, default 90", default: 90 },
+        },
+        required: ["name"],
+      },
+    });
+
+    tools.push({
+      name: "recurring_complaint_rooms",
+      description:
+        "List rooms with recurring complaints across the recent window. Use when the user asks 'which rooms have most complaints?', 'are there rooms we should check?', 'recurring problems'. Returns rooms with at least min_count complaints in the window.",
+      input_schema: {
+        type: "object",
+        properties: {
+          min_count: { type: "integer", description: "Minimum complaints to include, default 3", default: 3 },
+          days: { type: "integer", description: "Window in days, default 30 (use 90 for the longer view)", default: 30 },
+        },
+      },
+    });
+  }
+
+  // A-lister tools restricted to admin/management/guest_relations.
+  if (seeAlister) {
+    tools.push({
+      name: "top_alister_tas",
+      description:
+        "List the travel agents bringing the most A-list (notable) guests. Use when the user asks 'which TAs bring most A-listers?', 'who are our best agents for VIPs?'. Returns TAs with at least min_stays bookings ranked by A-lister volume.",
+      input_schema: {
+        type: "object",
+        properties: {
+          min_stays: { type: "integer", description: "Minimum total stays to include, default 3", default: 3 },
+        },
+      },
+    });
+
+    tools.push({
+      name: "alister_returners",
+      description:
+        "List A-list (notable) guests who have stayed multiple times. Use when the user asks 'which A-listers are returning?', 'who are our loyal VIPs?'. Returns guests with stay_count >= min_stays.",
+      input_schema: {
+        type: "object",
+        properties: {
+          min_stays: { type: "integer", description: "Minimum stay count to include, default 2", default: 2 },
+        },
+      },
+    });
+  }
+
+  return tools;
+}
+
+async function runGraphTool(supa: any, name: string, input: Record<string, any>): Promise<any> {
+  try {
+    switch (name) {
+      case "guest_history": {
+        const { data, error } = await supa.rpc("graph_guest_history", {
+          p_name: String(input.name ?? ""),
+          p_country: input.country ? String(input.country) : null,
+        });
+        if (error) return { error: error.message };
+        return data ?? [];
+      }
+      case "room_complaints": {
+        const { data, error } = await supa.rpc("graph_room_complaints", {
+          p_room: String(input.room ?? ""),
+          p_days: Number(input.days ?? 90),
+        });
+        if (error) return { error: error.message };
+        return data ?? {};
+      }
+      case "ta_overview": {
+        const { data, error } = await supa.rpc("graph_ta_overview", {
+          p_name: String(input.name ?? ""),
+          p_days: Number(input.days ?? 90),
+        });
+        if (error) return { error: error.message };
+        return data ?? [];
+      }
+      case "recurring_complaint_rooms": {
+        const { data, error } = await supa.rpc("graph_recurring_complaint_rooms", {
+          p_min_count: Number(input.min_count ?? 3),
+          p_days: Number(input.days ?? 30),
+        });
+        if (error) return { error: error.message };
+        return data ?? [];
+      }
+      case "top_alister_tas": {
+        const { data, error } = await supa.rpc("graph_top_alister_tas", {
+          p_min_stays: Number(input.min_stays ?? 3),
+        });
+        if (error) return { error: error.message };
+        return data ?? [];
+      }
+      case "alister_returners": {
+        const { data, error } = await supa.rpc("graph_alister_returners", {
+          p_min_stays: Number(input.min_stays ?? 2),
+        });
+        if (error) return { error: error.message };
+        return data ?? [];
+      }
+      default:
+        return { error: `unknown tool: ${name}` };
+    }
+  } catch (e) {
+    return { error: String((e as Error)?.message ?? e).slice(0, 500) };
+  }
 }
 
 
