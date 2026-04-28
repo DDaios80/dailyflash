@@ -63,11 +63,11 @@ select
       and af.review_status in ('confirmed','needs_review')
       and af.confidence >= 85
   ) as is_alister,
-  -- Best-effort allergy flag (any comment_extraction with allergy_flag)
+  -- Best-effort allergy flag from comment_extractions
   exists (
     select 1 from comment_extractions ce
-    where ce.resv_name_id = r.resv_name_id
-      and (ce.payload->>'allergy_flag')::boolean is true
+    where ce.reservation_id = r.id
+      and ce.allergies_present = true
   ) as has_allergy
 from reservations r
 where r.arrival is not null;
