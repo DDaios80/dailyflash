@@ -108,12 +108,19 @@ def _list_and_download_latest(folder_path: str, target_dir: Path) -> Optional[Pa
 
 
 def _match_date_in_name(name: str, d: date) -> bool:
-    """Does the filename contain a DD.MM.YYYY or DD-MM-YYYY or YYYY-MM-DD
-    stamp matching `d`?"""
+    """Does the filename contain a date stamp matching `d`?
+
+    Accepts:
+      - DD.MM.YYYY / DD-MM-YYYY / YYYY-MM-DD (year-bearing)
+      - DD.MM / DD-MM (bare day-month — current OneDrive filename style for
+        e.g. 'eur_birthday30.04.xlsx', 'Daily Flash 28.04.xlsx')
+    """
     patterns = [
         f"{d.day:02d}.{d.month:02d}.{d.year:04d}",
         f"{d.day:02d}-{d.month:02d}-{d.year:04d}",
         f"{d.year:04d}-{d.month:02d}-{d.day:02d}",
+        f"{d.day:02d}.{d.month:02d}",
+        f"{d.day:02d}-{d.month:02d}",
     ]
     n = name.lower()
     return any(p.lower() in n for p in patterns)
