@@ -73,12 +73,16 @@ COMMENT_ATTENTION_PHRASES = (
 )
 
 # Travel-agent / group names that warrant special attention on their own.
-# Kept tight to genuine luxury channels. Removed 23 Apr 2026:
-#   WEBHOTELIER — direct booking engine, not a TA
-#   AIRTOURS, DERTOUR, DER TOUR, JET2 — bulk contract tour operators, not VIP
+# Kept tight to genuine luxury channels.
+# Pruning history:
+#   23 Apr 2026 — removed WEBHOTELIER (booking engine, not a TA),
+#                 AIRTOURS / DERTOUR / DER TOUR / JET2 (bulk contract operators)
+#   3 May 2026 — removed ODEON (their CORAL contract is a bulk operation —
+#                Axel Born / Paulina Born and many others were being flagged
+#                with no other signal). Genuine Odeon VIPs still get flagged
+#                via their VIP / honeymoon / comments / allergy fields.
 NOTABLE_AGENT_KEYWORDS = (
     "NYHAVN",
-    "ODEON",
     "STRONG TRAVEL",
     "VIRTUOSO",
 )
