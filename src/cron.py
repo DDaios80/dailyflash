@@ -182,6 +182,17 @@ def main() -> int:
     except Exception as e:
         print(f"[cron] pipeline failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
+
+    # Phase 28 — sync FAM trip PDFs from OneDrive.
+    # Best-effort: failures don't fail the cron, the flash report itself
+    # is already written above.
+    try:
+        from fam_trip_sync import sync as fam_sync
+        fam_sync()
+    except Exception as e:
+        print(f"[cron] fam-trip sync failed (non-fatal): {type(e).__name__}: {e}",
+              file=sys.stderr)
+
     return 0
 
 

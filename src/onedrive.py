@@ -242,3 +242,42 @@ def fetch_birthdays_for_date(
     return _fetch_dated_xlsx_with_fallback(
         f"{cfg['folder']}/Birthdays", export_date, target_dir,
     )
+
+
+# ─── Phase 28 — FAM trip PDFs ─────────────────────────────────────────────
+
+def list_fam_trip_pdfs() -> list[dict]:
+    """List PDFs in {folder}/FAM TRIPS/. Returns Graph item dicts with
+    keys: id, name, lastModifiedDateTime, size, @microsoft.graph.downloadUrl.
+    Skips non-PDF files (e.g. weekly xlsx report).
+    Returns [] if folder doesn't exist or has no PDFs.
+    """
+    cfg = _config()
+    token = _refresh_access_token(cfg)
+    headers = {"Authorization": f"Bearer {token}"}
+    folder_path = f"{cfg['folder']}/FAM TRIPS"
+    list_url = (
+        f"{_GRAPH}/me/drive/root:/{folder_path}:/children"
+        "?$orderby=lastModifiedDateTime desc&$top=200"
+        "&$select=id,name,lastModifiedDateTime,size,@microsoft.graph.downloadUrl"
+    )
+    r = requests.get(list_url, headers=headers, timeout=30)
+    if r.status_code == 404:
+        return []
+    if r.status_code >= 400:
+        raise GraphError(f"FAM TRIPS folder listing failed ({r.status_code}): {r.text[:500]}")
+    items = (r.json().get("value") or [])
+    return [it for it in items if (it.get("name") or "").lower().endswith(".pdf")]
+
+
+def download_pdf_bytes(item: dict) -> bytes:
+    """Download a Graph PDF item directly to memory. The pipeline streams
+    the bytes to the ingest edge function via base64 — no local disk write."""
+    cfg = _config()
+    token = _refresh_access_token(cfg)
+    headers = {"Authorization": f"Bearer {token}"}
+    dl = item.get("@microsoft.graph.downloadUrl") or f"{_GRAPH}/me/drive/items/{item['id']}/content"
+    rr = requests.get(dl, headers=headers, timeout=180)
+    if rr.status_code >= 400:
+        raise GraphError(f"PDF download failed ({rr.status_code}): {rr.text[:500]}")
+    return rr.content
