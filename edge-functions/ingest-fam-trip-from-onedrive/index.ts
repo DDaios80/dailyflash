@@ -59,6 +59,9 @@ Deno.serve(async (req) => {
   const startDate: string    = (body?.start_date ?? "").toString();
   const endDate: string      = (body?.end_date ?? "").toString();
   const createdBy: string    = (body?.created_by_user_id ?? "").toString();
+  // Optional — defaults to the creator (admin imports + approves their own
+  // OneDrive uploads). If you want a separate approver, pass it explicitly.
+  const approverId: string   = (body?.approver_user_id ?? createdBy).toString();
 
   if (!pdfFilename || !pdfBase64 || !name || !startDate || !endDate || !createdBy) {
     return json({ error: "missing required fields" }, 400);
@@ -91,7 +94,34 @@ Deno.serve(async (req) => {
     });
   if (upErr) return json({ error: `storage: ${upErr.message}` }, 500);
 
-  // ── 3. Insert fam_trips row ──────────────────────────────────────────
+  // ── 3. Look up the approver and validate they're admin/management ────
+  // Mirrors submit_fam_trip_for_approval RPC — without this the approval
+  // email function bails with "approver not in list_fam_trip_approvers".
+  const { data: approverRow, error: appErr } = await supa
+    .from("user_roles")
+    .select("user_id, role")
+    .eq("user_id", approverId)
+    .in("role", ["admin", "management"])
+    .maybeSingle();
+  if (appErr || !approverRow) {
+    await supa.storage.from("fam-trip-pdfs").remove([storagePath]);
+    return json({ error: "approver_user_id must have role admin or management" }, 400);
+  }
+
+  // Pull the approver's display name from auth.users (best-effort)
+  let approverName: string | null = null;
+  try {
+    const { data: authUser } = await supa.auth.admin.getUserById(approverId);
+    const meta = (authUser?.user?.user_metadata as Record<string, unknown> | undefined) ?? {};
+    approverName = (meta.full_name as string) || (meta.name as string) || authUser?.user?.email || null;
+  } catch (_e) {
+    approverName = null;
+  }
+
+  // Generate the approval token (same shape as submit_fam_trip_for_approval RPC)
+  const approvalToken = crypto.randomUUID().replace(/-/g, "");
+
+  // ── 4. Insert fam_trips row with approver + token pre-filled ─────────
   const { data: inserted, error: insErr } = await supa
     .from("fam_trips")
     .insert({
@@ -104,18 +134,20 @@ Deno.serve(async (req) => {
       pdf_size_bytes: pdfSizeBytes,
       created_by_user_id: createdBy,
       created_by_name: "OneDrive auto-import",
+      approver_user_id: approverId,
+      approver_name: approverName,
+      approval_token: approvalToken,
       status: "pending_approval",
       submitted_at: new Date().toISOString(),
     })
     .select("id")
     .single();
   if (insErr) {
-    // Best-effort cleanup if row insert fails after upload
     await supa.storage.from("fam-trip-pdfs").remove([storagePath]);
     return json({ error: `insert: ${insErr.message}` }, 500);
   }
 
-  // ── 4. Fire parse-fam-trip-itinerary ─────────────────────────────────
+  // ── 5. Fire parse-fam-trip-itinerary ─────────────────────────────────
   let parsed = false;
   try {
     const parseUrl = `${supabaseUrl}/functions/v1/parse-fam-trip-itinerary`;
@@ -129,11 +161,38 @@ Deno.serve(async (req) => {
     });
     parsed = r.ok;
   } catch (_e) {
-    // Non-fatal — admin can still approve and re-trigger from the UI
     parsed = false;
   }
 
-  return json({ ok: true, trip_id: inserted.id, skipped: false, parsed });
+  // ── 6. Fire send-fam-trip-approval ───────────────────────────────────
+  // This is the email approver receives with Approve/Reject buttons + PDF.
+  let emailed = false;
+  try {
+    const emailUrl = `${supabaseUrl}/functions/v1/send-fam-trip-approval`;
+    const r = await fetch(emailUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${secret}`,
+      },
+      body: JSON.stringify({ trip_id: inserted.id }),
+    });
+    emailed = r.ok;
+    if (!r.ok) {
+      console.error("approval email failed:", r.status, await r.text().catch(() => ""));
+    }
+  } catch (e) {
+    console.error("approval email exception:", String((e as Error)?.message ?? e));
+    emailed = false;
+  }
+
+  return json({
+    ok: true,
+    trip_id: inserted.id,
+    skipped: false,
+    parsed,
+    emailed,
+  });
 });
 
 function base64ToUint8(b64: string): Uint8Array {
