@@ -29,6 +29,18 @@ from supa import client
 BATCH_SIZE = 500
 
 
+def _merge_ops_notes(data: dict) -> str | None:
+    """Combine LLM ops_notes + payment_notes into a single text field.
+    Falls back to the deprecated ops_summary key if present."""
+    primary = data.get("ops_notes") or data.get("ops_summary") or ""
+    payment = data.get("payment_notes") or ""
+    if primary and payment:
+        if primary.endswith(payment):
+            return primary
+        return f"{primary}\n- {payment}"
+    return primary or payment or None
+
+
 def _jsonable(v: Any) -> Any:
     if isinstance(v, (datetime, date)):
         return v.isoformat()
@@ -131,7 +143,7 @@ def upload_file(
                 "lco": data.get("late_checkout", False),
                 "honeymoon": data.get("honeymoon", False),
                 "amenities": data.get("amenities") or [],
-                "ops_notes": data.get("ops_summary") or data.get("payment_notes"),
+                "ops_notes": _merge_ops_notes(data),
             })
 
         if ext_rows:

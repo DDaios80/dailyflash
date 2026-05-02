@@ -102,19 +102,19 @@ def render(flash, extractions_by_resv_id: Optional[dict] = None) -> None:
             _section(f"HONEYMOON / ANNIVERSARY (from COMMENTS) ({len(extra_hon)})")
             for rid in extra_hon:
                 ext = extractions_by_resv_id[rid]
-                print(f"  resv={rid}  {ext.get('ops_summary')}")
+                print(f"  resv={rid}  {ext.get('ops_notes') or ext.get('ops_summary')}")
 
         pf = [(rid, ext) for rid, ext in extractions_by_resv_id.items() if ext.get("pool_fence")]
         if pf:
             _section(f"POOL FENCE / CHILD SAFETY ({len(pf)})")
             for rid, ext in pf:
-                print(f"  resv={rid}  {ext.get('ops_summary')}")
+                print(f"  resv={rid}  {ext.get('ops_notes') or ext.get('ops_summary')}")
 
         up = [(rid, ext) for rid, ext in extractions_by_resv_id.items() if ext.get("free_upgrade")]
         if up:
             _section(f"FREE UPGRADES TO COMMUNICATE ({len(up)})")
             for rid, ext in up:
-                print(f"  resv={rid}  {ext.get('ops_summary')}")
+                print(f"  resv={rid}  {ext.get('ops_notes') or ext.get('ops_summary')}")
 
     # Allergy section: union of keyword prefilter + LLM extraction
     allergy_rids = {g.get("resv_name_id") for g in flash.allergies_in_house if g.get("resv_name_id")}
@@ -132,7 +132,7 @@ def render(flash, extractions_by_resv_id: Optional[dict] = None) -> None:
         printed.add(rid)
     for rid in allergy_rids - printed:
         ext = extractions_by_resv_id[rid]
-        text = ext.get("allergies_text") or ext.get("ops_summary") or ""
+        text = ext.get("allergies_text") or ext.get("ops_notes") or ext.get("ops_summary") or ""
         print(f"  resv={rid}  ⚠️  {text}")
 
 

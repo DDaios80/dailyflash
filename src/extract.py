@@ -79,23 +79,41 @@ class CommentExtraction(BaseModel):
     amenities: list[str] = Field(
         default_factory=list,
         description=(
-            "List of specific amenities offered — e.g. 'Raki 200ml', "
-            "'breakfast in room', 'spa voucher', 'olive paste platter'. "
-            "Empty list if none."
+            "Physical welcome-amenity items prepared for the guest's room or "
+            "arrival — concrete things placed in the room or served on arrival. "
+            "Examples: 'Raki 200ml', 'fresh fruit basket', 'sparkling wine', "
+            "'in-room breakfast', 'olive paste platter', 'flower arrangement', "
+            "'sugared almonds bed decor'. "
+            "DO NOT include: resort credits, discounts, free upgrades, free "
+            "transfers, requested room equipment (high chairs, bottle "
+            "warmers, baby food, extra towels), mobility/accessibility aids, "
+            "payment/tax instructions, or any operational requests. "
+            "Those go in ops_notes or the specific boolean fields. "
+            "Empty list if there are no welcome-amenity items."
         ),
     )
     payment_notes: Optional[str] = Field(
         default=None,
         description=(
-            "Short note about payment or tax instructions (e.g. "
-            "'100% on arrival', 'government tax paid by guest on check-out'). "
+            "Short note about payment, tax, or resort-credit instructions "
+            "(e.g. '100% on arrival', 'government tax paid by guest on check-out', "
+            "'€75 JET2 resort credit per booking — not valid for Spa or Kids Club'). "
             "Null if none."
         ),
     )
-    ops_summary: str = Field(
+    ops_notes: str = Field(
         description=(
-            "One-sentence operational summary of the comment, oriented to front office / "
-            "guest relations. Leave empty string if comment is truly empty."
+            "Structured operational notes for front office / guest relations. "
+            "Multi-line bullet list capturing EVERY important detail from the "
+            "comment that doesn't already fit allergies, amenities, or the "
+            "specific boolean flags. Format: each fact on its own line, prefixed "
+            "with '- '. Cover: party context (honeymoon, anniversary, VIP, "
+            "trade booking, repeater), room-equipment requests (baby gear, "
+            "mobility aids, extra towels), upgrade/transfer/late-checkout "
+            "requests, special occasions, dietary preferences (non-allergy), "
+            "first-aid/medical context, room view or rate notes, anything "
+            "marked URGENT/PRIORITY. Empty string only if the comment is "
+            "truly empty or 'TEST'."
         )
     )
 
@@ -112,20 +130,46 @@ Rules:
 1. ALLERGIES are the single most important field. If the text contains ANY \
    indication of allergy, intolerance, or special dietary need, set \
    `allergies_present=true` and copy the relevant sentence to `allergies_text`. \
-   Never bury an allergy inside ops_summary and leave the field false. If it \
+   Never bury an allergy inside ops_notes and leave the field false. If it \
    says "cross-check allergies with the guests" with no specific allergen, \
    still mark `allergies_present=true`.
+
 2. Distinguish request vs granted. "free transfer" → free_transfer=true. \
    "check if departure transfer is required" → free_transfer=false.
-3. `amenities` is a list of concrete items offered to the guest (gift, \
-   voucher, in-room breakfast, spa treatments). Do NOT include generic \
-   operational notes.
-4. `payment_notes` captures who pays what and when (100% on arrival, climate \
-   tax by guest, etc.). Keep it concise.
-5. `ops_summary` is ONE sentence, factual, no fluff. Do not duplicate other \
-   fields.
+
+3. `amenities` IS STRICTLY for physical welcome-amenity items placed in the \
+   room or served on arrival. Examples that ARE amenities: "Raki 200ml", \
+   "fresh fruit basket", "sparkling wine", "in-room breakfast", "olive paste \
+   platter", "flower arrangement", "sugared almonds bed decor", "honey & \
+   walnuts platter". \
+   Examples that are NOT amenities (these go in ops_notes or specific boolean \
+   fields): \
+     - Resort credits and discounts ("€75 resort credit", "20% off KEPOS") \
+     - Free upgrades ("upgrade to CPRESP if available") → free_upgrade=true + ops_notes \
+     - Free transfers → free_transfer=true \
+     - Requested room equipment ("bottle warmer", "high chair", "baby food set", \
+       "extra towels", "interconnecting room") \
+     - Mobility / accessibility aids ("wheelchair", "ramp access") \
+     - Payment instructions ("government tax on checkout") → payment_notes \
+   When in doubt, ask: "is this a physical item the team places in the room \
+   as a gift?" If yes → amenity. If no → ops_notes.
+
+4. `payment_notes` captures payment/tax/resort-credit terms (who pays what, \
+   when, what's included or excluded). Keep it concise but complete.
+
+5. `ops_notes` is a MULTI-LINE BULLET LIST, one fact per line, prefixed with \
+   "- ". It must capture EVERY important detail from the comment that doesn't \
+   already fit allergies, amenities, or specific boolean flags. Do not compress \
+   to one sentence. Do not omit details to keep it short. The front office \
+   reads this when they pull up the guest record — losing context here means \
+   losing it for service. \
+   Cover: party context (honeymoon, anniversary, trade booking, repeater, VIP), \
+   equipment requests, upgrade/transfer/late-checkout context, special occasions, \
+   medical/first-aid context, room view or rate notes, anything URGENT.
+
 6. If the comment is empty, the string "TEST", or meaningless, set all \
-   booleans to false, lists to empty, strings to null, and ops_summary to "".
+   booleans to false, lists to empty, strings to null, and ops_notes to "".
+
 7. Never invent facts. If the comment doesn't say it, don't set it.
 
 Examples:
@@ -136,7 +180,8 @@ cross-check allergies with the guests.\n\nPOOL FENCE FREE\n3 kids = new born \
 baby & 2y.o & 4 y.o.\n\nRequest for LCO until midday"
 
 → allergies_present=true, allergies_text="Dr. Magistro is allergic to nuts",
-  pool_fence=true, late_checkout=true, ops_summary="Allergy (nuts), pool fence requested, 3 young children, late checkout requested until midday."
+  pool_fence=true, late_checkout=true,
+  ops_notes="- Family of 3 children: newborn, 2 y.o., 4 y.o.\\n- Late checkout requested until midday\\n- Pool fence requested\\n- Cross-check allergy details with guest on arrival"
 
 COMMENTS:
 "Repeaters:\nRaki 200ml & 1L Water\nMini Rusks, olive paste platter\n1xFree of \
@@ -144,26 +189,43 @@ Thermal Spa Suite for 2 Adults\nin-room breakfast\n\nGOVERNMENT TAX TO BE PAID \
 BY THE GUESTS UPON CHECK OUT"
 
 → amenities=["Raki 200ml", "1L Water", "Mini Rusks", "olive paste platter",
-             "Thermal Spa Suite for 2 adults", "in-room breakfast"],
+             "Thermal Spa Suite for 2 Adults", "in-room breakfast"],
   payment_notes="Government tax paid by guests on check-out",
-  ops_summary="Repeater welcome amenities prepared; guest to pay government tax on checkout."
+  ops_notes="- Repeater guests — set up arrival amenity package"
+
+COMMENTS:
+"DLXP on RC as per SL - sea view please\n\nKrystle Johnston - Head of Sales \
+at Destinology\nLauren Dempster - Sales Manager at Destinology (Mother and \
+daughter)\nbaby = 10 m. - plz place a Bottle warmer/steriliser, High chair, \
+Baby food set\n\nRepeaters:\nRaki 200ml & 1L Water\nMini Rusks, olive paste \
+platter\n1xFree of Thermal Spa Suite for 2 Adults\nin-room breakfast\n\n\
+€100 resort credit per booking (non-refundable, valid for extra F&B, spa \
+treatments, vitality pool — excludes creche and spa products)"
+
+→ amenities=["Raki 200ml", "1L Water", "Mini Rusks", "olive paste platter",
+             "Thermal Spa Suite for 2 Adults", "in-room breakfast"],
+  payment_notes="€100 Destinology resort credit per booking (non-refundable) — valid for extra F&B, spa treatments, vitality pool. Excludes creche and spa products.",
+  vip_flag=true,
+  ops_notes="- Trade booking — Destinology Head of Sales (Krystle Johnston) and Sales Manager (Lauren Dempster), mother and daughter\\n- DLXP on RC rate, sea view requested\\n- 10-month-old baby — place bottle warmer/steriliser, high chair, baby food set in room\\n- Repeater guests — set up arrival amenity package"
 
 COMMENTS:
 "already in house from 18/04\nfree transfers\n\nFirst aid training kids club"
 → already_in_house=true, free_transfer=true,
-  ops_summary="Guest already in house since 18/04; free transfers; child attending first-aid kids-club session."
+  ops_notes="- Already in house since 18/04\\n- Child attending first-aid kids-club session"
 
 COMMENTS:
 "INFORM FOR FREE UPGRADE CJSTE-->CPRESP"
-→ free_upgrade=true, ops_summary="Free upgrade CJSTE to CPRESP to be communicated to the guest."
+→ free_upgrade=true,
+  ops_notes="- Free upgrade CJSTE → CPRESP to be communicated to the guest on arrival"
 
 COMMENTS:
 "VIP Booking - Extra Attention"
-→ vip_flag=true, ops_summary="VIP booking; give extra attention on arrival."
+→ vip_flag=true,
+  ops_notes="- VIP booking — give extra attention on arrival"
 
 COMMENTS:
 "TEST"
-→ all false/null/empty.
+→ all false/null/empty, ops_notes="".
 """
 
 
@@ -312,7 +374,7 @@ def main() -> int:
             r = by_resv_id.get(rid, {})
             room = r.get("room") or "?"
             name = (r.get("guest_first_name") or "") + " " + (r.get("guest_name") or "")
-            extra = getattr(ext, field) if field else ext.ops_summary
+            extra = getattr(ext, field) if field else ext.ops_notes
             print(f"  {room:>5}  {name.strip():<30}  {extra}")
 
     _show("ALLERGIES", allergies, "allergies_text")

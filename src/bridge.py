@@ -68,13 +68,19 @@ def build_envelope(
     reservations = [_json_safe(r) for r in records]
 
     # Map the richer Pydantic CommentExtraction fields onto the table schema:
-    # late_checkout → lco ; ops_summary/payment_notes → ops_notes ; drop
-    # vip_flag / already_in_house (not persisted, UI uses them via flash_report_payload).
+    # late_checkout → lco ; merge ops_notes + payment_notes ; drop vip_flag /
+    # already_in_house (not persisted, UI uses them via flash_report_payload).
     def _to_extraction_row(rnid: int, ext: dict) -> dict:
-        ops_notes = ext.get("ops_notes") or ext.get("ops_summary") or ext.get("payment_notes")
-        # If both ops_summary and payment_notes exist, concatenate.
-        if ext.get("ops_summary") and ext.get("payment_notes") and ops_notes == ext.get("ops_summary"):
-            ops_notes = f"{ext['ops_summary']} — {ext['payment_notes']}"
+        # Prefer the LLM's structured ops_notes; fall back to the deprecated
+        # ops_summary key for any in-flight extractions still on the old
+        # schema. Append payment_notes so the team sees payment/credit terms
+        # in the same field.
+        primary = ext.get("ops_notes") or ext.get("ops_summary") or ""
+        payment = ext.get("payment_notes") or ""
+        if primary and payment:
+            ops_notes = f"{primary}\n- {payment}" if not primary.endswith(payment) else primary
+        else:
+            ops_notes = primary or payment or None
         return {
             "resv_name_id": rnid,
             "allergies_present": bool(ext.get("allergies_present")),
