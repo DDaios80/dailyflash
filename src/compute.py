@@ -172,8 +172,13 @@ def special_attention_reason(r: dict[str, Any]) -> str | None:
     if "VIP" in codes and "VIP" not in " ".join(reasons).upper():
         reasons.append("VIP request")
 
-    if has_allergy_keywords(r):
-        reasons.append("Allergy note")
+    # NOTE: allergy presence is NOT a special-attention reason on its own.
+    # Allergies have their own dedicated `allergies_in_house` section in the
+    # flash payload. Adding "Allergy note" here caused the same guest to
+    # show up twice on the flash (once under Special Attention, once under
+    # Allergies). If the guest has another genuine special-attention signal
+    # (VIP, honeymoon, complimentary, etc.) they'll still appear here for
+    # that reason — and separately in the allergies section.
 
     phrase = _comment_attention_match(r)
     if phrase == "vip":
