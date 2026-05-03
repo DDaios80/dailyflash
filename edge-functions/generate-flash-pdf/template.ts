@@ -194,8 +194,32 @@ function renderGuestTable(title: string, rows: GuestRow[] | undefined): string {
 }
 
 function renderBirthdays(rows: GuestRow[] | undefined): string {
-  if (!rows?.length) return `<div class="gt"><div class="gt-title">Birthdays - Anniversaries - Honeymoon</div></div>`;
-  return renderGuestTable("Birthdays - Anniversaries - Honeymoon", rows);
+  // Phase 28.8 — line-by-line layout. Each guest gets its own row with the
+  // age and departure date called out, instead of the generic dot-separated
+  // soup that renderGuestTable produced.
+  const title = "Birthdays - Anniversaries - Honeymoon";
+  if (!rows?.length) return `<div class="gt"><div class="gt-title">${esc(title)}</div></div>`;
+  const items = rows.map((r) => {
+    const room    = r.room ?? r.room_number ?? "";
+    const name    = r.guest_name ?? r.name ?? "";
+    const ageNum  = typeof (r as any).age === "number" ? (r as any).age : ((r as any).age ? Number((r as any).age) : null);
+    const ageText = ageNum && Number.isFinite(ageNum) ? `turns ${ageNum} today` : "birthday today";
+    const dep     = (r as any).departure ?? "";
+    const depText = dep ? `dep ${formatPdfDate(dep)}` : "";
+    const tail    = [ageText, depText].filter(Boolean).join(" · ");
+    return `<div class="gt-row"><span class="gt-room">${esc(room)}</span><span class="gt-name">${esc(name)}${tail ? ` - ${esc(tail)}` : ""}</span></div>`;
+  }).join("");
+  return `<div class="gt"><div class="gt-title">${esc(title)}</div>${items}</div>`;
+}
+
+function formatPdfDate(s: string): string {
+  try {
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+  } catch {
+    return s;
+  }
 }
 
 function renderAlister(rows: AlisterRow[] | undefined): string {

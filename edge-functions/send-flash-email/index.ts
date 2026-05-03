@@ -811,7 +811,7 @@ function renderSection(section: Section, payload: Record<string, any>): string {
     case "pep_arrivals":
       return renderGuestList("PEP arrivals", payload.pep_arrivals ?? []);
     case "birthdays_in_house":
-      return renderGuestList("Birthdays in-house", payload.birthdays_in_house ?? []);
+      return renderBirthdays(payload.birthdays_in_house ?? []);
     case "allergies_in_house": return renderAllergies(payload.allergies_in_house ?? []);
     case "alister_findings": return renderAlister(payload.alister_findings ?? []);
     case "pool_heating": return renderPoolHeating(payload.pool_heating ?? []);
@@ -877,6 +877,41 @@ function renderAllergies(rows: any[]): string {
     </tr>`;
   }).join("");
   return `${h2("Allergies — in-house")}<table style="width:100%;border-collapse:collapse;font-size:13px">${items}</table>`;
+}
+
+function renderBirthdays(rows: any[]): string {
+  // Phase 28.8 — line-by-line layout. Replaces the generic renderGuestList
+  // which only showed room + name (the birthday-relevant `age` and
+  // `birth_date` fields weren't read). Two-line block per guest, mirroring
+  // the renderAllergies pattern so birthdays / allergies feel consistent.
+  if (!rows?.length) return "";
+  const items = rows.map((r) => {
+    const room    = r.room ?? r.room_number ?? "—";
+    const name    = r.guest_name ?? r.name ?? "";
+    const ageNum  = typeof r.age === "number" ? r.age : (r.age ? Number(r.age) : null);
+    const ageText = ageNum && Number.isFinite(ageNum) ? `Turns ${ageNum} today` : "Birthday today";
+    const departure = r.departure ?? r.dep_date ?? "";
+    const stayLine  = departure ? `Departing ${escapeHtml(formatStayDate(departure))}` : "";
+    return `<tr>
+      <td style="padding:8px 10px;border-bottom:1px solid #f5e8c8;background:#fff8e6;font-weight:600;color:#a38a6a;white-space:nowrap;vertical-align:top">${escapeHtml(room)}</td>
+      <td style="padding:8px 10px;border-bottom:1px solid #f5e8c8;background:#fff8e6">
+        <div style="font-weight:500">${escapeHtml(name)}</div>
+        <div style="color:#9a3412;font-size:13px;margin-top:2px">🎂 ${escapeHtml(ageText)}${stayLine ? ` · ${stayLine}` : ""}</div>
+      </td>
+    </tr>`;
+  }).join("");
+  return `${h2("Birthdays — in-house")}<table style="width:100%;border-collapse:collapse;font-size:13px">${items}</table>`;
+}
+
+function formatStayDate(s: string): string {
+  // Accept ISO "2026-05-12" or full timestamp; render as "12 May".
+  try {
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
+  } catch {
+    return s;
+  }
 }
 
 function renderAlister(rows: any[]): string {
