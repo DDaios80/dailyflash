@@ -251,6 +251,37 @@ class OccupancyDay:
     arrivals: int
     departures: int
     occupancy_pct: float
+    # Phase 30 — finer breakdowns for the dashboard totals row.
+    # Party-composition split: adults-only vs families with children.
+    adults_only_rooms: int = 0
+    adults_only_guests: int = 0
+    family_rooms: int = 0
+    family_guests: int = 0
+    # Room-category split. Standard / Suite (no Collection) / Collection / Villa.
+    # Counts are room counts; the dashboard can derive percentages.
+    rooms_by_category: dict[str, int] = field(default_factory=dict)
+
+
+# Room-category buckets. Heuristic on `room_category_label` from Opera.
+# Order matters — first match wins.
+def _room_bucket(label: str | None) -> str:
+    if not label:
+        return "Unknown"
+    code = label.strip().upper()
+    if not code:
+        return "Unknown"
+    if code.startswith("V"):
+        return "Villa"
+    # Collection — every C-prefix code observed in production is a
+    # Collection-tier room (CJSTE, CJSTEP, CSTEP, CPRES, CPRESP, CPJSTP).
+    # If a future non-Collection C-code appears, narrow this rule.
+    if code.startswith("C"):
+        return "Collection"
+    # Suite (non-Collection) — D-prefix Junior Suites and bare suite codes:
+    # DJSTE, DJSTEP, JSTEP, STE, STEP. They share STE/STP/JST suffixes.
+    if "STE" in code or "JST" in code or code.endswith("STP"):
+        return "Suite"
+    return "Standard"
 
 
 def occupancy_for_day(records: Iterable[dict[str, Any]], d: date, total_rooms: int = TOTAL_SELLABLE_ROOMS) -> OccupancyDay:
@@ -263,7 +294,32 @@ def occupancy_for_day(records: Iterable[dict[str, Any]], d: date, total_rooms: i
     arrivals = sum(1 for r in records if _arrives_on(r, d))
     departures = sum(1 for r in records if _departs_on(r, d))
     pct = (occ_rooms / total_rooms * 100) if total_rooms else 0.0
-    label = {0: "TODAY", 1: "TOMORROW", 2: "FOLLOWING"}.get(0)  # overwritten below
+
+    # Phase 30 — party-composition + category breakdowns. Counted at room
+    # level (not reservation level) so a guest sharing a room with an extra
+    # bed isn't double-counted.
+    rooms_seen: set[str] = set()
+    adults_only_rooms = 0
+    adults_only_guests = 0
+    family_rooms = 0
+    family_guests = 0
+    rooms_by_category: dict[str, int] = {}
+    for r in in_house:
+        room = r.get("room")
+        if not room or room in rooms_seen:
+            continue
+        rooms_seen.add(room)
+        children = int(r.get("children") or 0)
+        pax = int(r.get("pax") or 0)
+        if children > 0:
+            family_rooms += 1
+            family_guests += pax
+        else:
+            adults_only_rooms += 1
+            adults_only_guests += pax
+        bucket = _room_bucket(r.get("room_category_label") or r.get("booked_room_category_label"))
+        rooms_by_category[bucket] = rooms_by_category.get(bucket, 0) + 1
+
     return OccupancyDay(
         label="",  # filled in by compute_flash
         report_date=d,
@@ -272,6 +328,11 @@ def occupancy_for_day(records: Iterable[dict[str, Any]], d: date, total_rooms: i
         arrivals=arrivals,
         departures=departures,
         occupancy_pct=round(pct, 2),
+        adults_only_rooms=adults_only_rooms,
+        adults_only_guests=adults_only_guests,
+        family_rooms=family_rooms,
+        family_guests=family_guests,
+        rooms_by_category=rooms_by_category,
     )
 
 
