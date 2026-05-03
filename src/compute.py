@@ -313,6 +313,11 @@ class FlashGuest:
     allergy_flag: bool = False
     honeymoon: bool = False
     resv_name_id: int | None = None
+    # Phase 29.1 — raw Opera COMMENTS so admin can opt to print them in
+    # the flash PDF appendix. Most renderers ignore this field; only the
+    # PDF template's renderCommentsAppendix uses it when include_comments
+    # is on.
+    comments: str | None = None
 
 
 @dataclass
@@ -350,6 +355,7 @@ def _guest_payload(r: dict[str, Any]) -> dict[str, Any]:
         allergy_flag=has_allergy_keywords(r),
         honeymoon="HON" in _special_request_codes(r),
         resv_name_id=r.get("resv_name_id"),
+        comments=(r.get("comments") or None),
     ))
 
 

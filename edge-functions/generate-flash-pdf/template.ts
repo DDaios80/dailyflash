@@ -222,6 +222,49 @@ function formatPdfDate(s: string): string {
   }
 }
 
+// Phase 29.1 — admin-only opt-in appendix listing the raw Opera COMMENTS
+// per arrival. Skipped when includeComments is false. Pulls from the
+// special_attention_arrivals + complimentary_partner_arrivals + allergies
+// surfaces (de-duped by room) so the appendix covers every guest who
+// already appears anywhere on the flash. Empty comments are dropped.
+function renderCommentsAppendix(payload: FlashPayload): string {
+  type Row = { room?: string; name?: string; guest_name?: string; comments?: string | null };
+  const seen = new Set<string>();
+  const rows: Row[] = [];
+  const sources: (Row[] | undefined)[] = [
+    payload.special_attention_arrivals as Row[] | undefined,
+    payload.complimentary_partner_arrivals as Row[] | undefined,
+    payload.pep_arrivals as Row[] | undefined,
+    payload.allergies_in_house as Row[] | undefined,
+    (payload as any).booking_com_arrivals as Row[] | undefined,
+  ];
+  for (const list of sources) {
+    if (!list) continue;
+    for (const r of list) {
+      const key = (r.room ?? "") + "|" + (r.guest_name ?? r.name ?? "");
+      if (seen.has(key)) continue;
+      const c = (r.comments ?? "").toString().trim();
+      if (!c) continue;
+      seen.add(key);
+      rows.push(r);
+    }
+  }
+  if (!rows.length) return "";
+  const items = rows.map((r) => {
+    const room = r.room ?? "";
+    const name = r.guest_name ?? r.name ?? "";
+    const c    = (r.comments ?? "").toString().trim().slice(0, 800);
+    return `<div class="cmt-row">
+      <div class="cmt-head"><span class="cmt-room">${esc(room)}</span> <span class="cmt-name">${esc(name)}</span></div>
+      <div class="cmt-body">${esc(c)}</div>
+    </div>`;
+  }).join("");
+  return `<div class="cmt-appendix">
+    <div class="cmt-title">Guest Comments — Arrivals</div>
+    ${items}
+  </div>`;
+}
+
 function renderAlister(rows: AlisterRow[] | undefined): string {
   if (!rows?.length) return "";
   const items = rows.map((r) => {
@@ -248,6 +291,7 @@ export function renderFlashPdfHtml(
   payload: FlashPayload,
   reportDate: string,
   includeAlister: boolean,
+  includeComments: boolean = false,
 ): string {
   const occ = payload.occupancy ?? [];
   const briefing = payload.daily_briefing ?? null;
@@ -325,6 +369,15 @@ export function renderFlashPdfHtml(
   .bottom { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 4mm; }
   .bs-title { font-size: 9pt; }
   .bs-body { font-size: 7.5pt; line-height: 1.3; white-space: pre-wrap; }
+
+  /* Comments appendix (Phase 29.1) — admin-opt-in extra page */
+  .cmt-appendix { page-break-before: always; padding: 4mm 6mm; }
+  .cmt-title { font-size: 12pt; font-weight: bold; color: #7a8064; border-bottom: 2px solid #7a8064; padding-bottom: 4px; margin-bottom: 8px; letter-spacing: 1px; }
+  .cmt-row { margin-bottom: 6px; padding: 4px 6px; border-left: 2px solid #7a8064; background: #fafaf6; page-break-inside: avoid; }
+  .cmt-head { font-size: 9pt; margin-bottom: 2px; }
+  .cmt-room { font-weight: 600; color: #7a8064; }
+  .cmt-name { font-weight: 600; }
+  .cmt-body { font-size: 8pt; line-height: 1.35; white-space: pre-wrap; color: #333; }
 </style>
 </head>
 <body>
@@ -360,6 +413,8 @@ export function renderFlashPdfHtml(
     ${renderBriefingSection("Group Events", briefing?.group_events)}
     ${renderBirthdays(payload.birthdays_in_house)}
   </div>
+
+  ${includeComments ? renderCommentsAppendix(payload) : ""}
 
 </div>
 </body>
