@@ -96,6 +96,38 @@ NOTABLE_AGENT_KEYWORDS = (
 BOOKING_COM_TRAVEL_AGENTS = ("BOOKING", "BOOK")
 
 
+# Tour-operator / commercial-channel keywords that EXCLUDE a stay from
+# "partner arrivals" even when the booking is complimentary. These are
+# industry comp stays — TA/TO staff perks, agency-employee bookings,
+# bulk-channel comp — distinct from true partner arrivals (artists,
+# chefs, colleagues, internal collaborators that the resort hosts).
+# Same set as the agents pruned from NOTABLE_AGENT_KEYWORDS — these are
+# bulk-contract / commercial channels, not luxury or partner channels.
+TOUR_OPERATOR_KEYWORDS = (
+    "TUI",
+    "DERTOUR",
+    "DER TOUR",
+    "JET2",
+    "AIRTOURS",
+    "ODEON",
+    "WEBHOTELIER",
+    "BOOKING",
+    "BOOKING.COM",
+)
+
+
+def is_tour_operator_stay(r: dict[str, Any]) -> bool:
+    """True if the reservation comes through a commercial tour operator
+    or bulk channel. Used to exclude industry comp stays from
+    `partner_arrivals` so the partner section stays focused on true
+    partners (artists, chefs, colleagues, internal collaborators)."""
+    ta = (r.get("travel_agent_name") or "").upper()
+    g = (r.get("group_name") or "").upper()
+    if not ta and not g:
+        return False
+    return any(kw in ta or kw in g for kw in TOUR_OPERATOR_KEYWORDS)
+
+
 def is_booking_com(r: dict[str, Any]) -> bool:
     ta = (r.get("travel_agent_name") or "").strip().upper()
     if not ta:
@@ -358,10 +390,16 @@ def compute_flash(
         _guest_payload(r) for r in departures_ if _is_special(r)
     ]
 
+    # Partner arrivals = complimentary + companions, EXCLUDING commercial
+    # tour-operator channels. Tour operator staff getting industry comp is
+    # a different category and should not appear under "partners" — that
+    # surface is for artists, chefs, colleagues, and internal collaborators.
     complimentary_partner_arrivals = [
         _guest_payload(r)
         for r in arrivals
-        if is_complimentary(r) and r.get("accompanying_names")
+        if is_complimentary(r)
+        and r.get("accompanying_names")
+        and not is_tour_operator_stay(r)
     ]
 
     pep_arrivals = [_guest_payload(r) for r in arrivals if is_pep(r)]
