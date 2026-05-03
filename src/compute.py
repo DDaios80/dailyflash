@@ -74,26 +74,30 @@ COMMENT_ATTENTION_PHRASES = (
 
 # Travel-agent / group names that warrant special attention on their own.
 # Kept tight to genuine luxury channels.
-# Pruning history:
+# Pruning history (Daios Cove):
 #   23 Apr 2026 — removed WEBHOTELIER (booking engine, not a TA),
 #                 AIRTOURS / DERTOUR / DER TOUR / JET2 (bulk contract operators)
 #   3 May 2026 — removed ODEON (their CORAL contract is a bulk operation —
 #                Axel Born / Paulina Born and many others were being flagged
 #                with no other signal). Genuine Odeon VIPs still get flagged
 #                via their VIP / honeymoon / comments / allergy fields.
-NOTABLE_AGENT_KEYWORDS = (
-    "NYHAVN",
-    "STRONG TRAVEL",
-    "VIRTUOSO",
-)
+#
+# These pools are now driven by `src/property_config.py` so each Daios
+# Group property can have its own channel mix. Cove and DLL share the
+# same defaults today; they can diverge once DLL has a real booking
+# history.
+from property_config import get as _get_property
+_PROPERTY = _get_property()
+
+NOTABLE_AGENT_KEYWORDS = _PROPERTY.notable_agent_keywords
 
 
 # Booking.com bookings are flagged in their own Flash Report section so
-# teams can give them exceptional service — the goal is raising our
+# teams can give them exceptional service — the goal is raising the
 # Booking.com rating from 8.7 to 9.2+ (the "Excellent" threshold). In the
-# Opera export, these bookings carry travel_agent_name = "BOOKING" (1268
-# reservations in our data) or "BOOK" (53 — variant label).
-BOOKING_COM_TRAVEL_AGENTS = ("BOOKING", "BOOK")
+# Opera export, these bookings carry travel_agent_name = "BOOKING" or
+# "BOOK" (variant label).
+BOOKING_COM_TRAVEL_AGENTS = _PROPERTY.booking_com_travel_agents
 
 
 # Tour-operator / commercial-channel keywords that EXCLUDE a stay from
@@ -103,17 +107,7 @@ BOOKING_COM_TRAVEL_AGENTS = ("BOOKING", "BOOK")
 # chefs, colleagues, internal collaborators that the resort hosts).
 # Same set as the agents pruned from NOTABLE_AGENT_KEYWORDS — these are
 # bulk-contract / commercial channels, not luxury or partner channels.
-TOUR_OPERATOR_KEYWORDS = (
-    "TUI",
-    "DERTOUR",
-    "DER TOUR",
-    "JET2",
-    "AIRTOURS",
-    "ODEON",
-    "WEBHOTELIER",
-    "BOOKING",
-    "BOOKING.COM",
-)
+TOUR_OPERATOR_KEYWORDS = _PROPERTY.tour_operator_keywords
 
 
 def is_tour_operator_stay(r: dict[str, Any]) -> bool:
@@ -246,7 +240,7 @@ def special_attention_reason(r: dict[str, Any]) -> str | None:
 
 # ─── Occupancy trio (today / tomorrow / following) ──────────────────────────
 
-TOTAL_SELLABLE_ROOMS = 276  # Daios Cove total sellable rooms (confirmed 2026-04-21)
+TOTAL_SELLABLE_ROOMS = _PROPERTY.total_sellable_rooms  # property-driven (Cove=276, DLL=49)
 
 @dataclass
 class OccupancyDay:
