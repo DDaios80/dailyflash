@@ -109,6 +109,16 @@ def fetch_weather(
             continue
         code = int(codes[i]) if i < len(codes) else 0
         condition, icon = _WMO.get(code, ("—", "cloud"))
+        # Phase 31.1 — defensive labelling. The flash is computed on Day N
+        # for Day N+1 (= report_date). Some dashboard renderers used to
+        # treat the `label` field as relative to calendar today rather
+        # than relative to report_date, producing off-by-one displays.
+        # Add explicit fields the renderer can use unambiguously:
+        #   days_from_report_date: 0 for TODAY, 1 for TOMORROW, 2 for FOLLOWING
+        #   report_date_iso: copy of the flash's report_date for cross-check
+        #   display_label: combined relative + absolute, e.g. "TODAY · Sun 4 May"
+        # Renderers should now use `display_label` (or `date` directly) and
+        # ignore the bare `label` field if there's any chance of confusion.
         out.append({
             "label": _label_for_offset(i),
             "date": iso_date,
@@ -118,6 +128,10 @@ def fetch_weather(
             "condition": condition,
             "icon": icon,
             "code": code,
+            # New fields (Phase 31.1)
+            "days_from_report_date": i,
+            "report_date_iso": report_date.isoformat(),
+            "display_label": f"{_label_for_offset(i)} · {d.strftime('%a %d %b')}",
         })
     return out
 
