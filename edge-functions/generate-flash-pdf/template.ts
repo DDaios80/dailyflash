@@ -154,17 +154,13 @@ function renderModCard(b: Briefing | null | undefined): string {
 </div>`;
 }
 
-function renderSpecialRequest(allergies: GuestRow[] | undefined): string {
-  // In the sample, "Special Request" shows allergy notes like "202 One daughter has peanuts allergy"
-  // We derive it from allergies_in_house (the critical per-room notes).
-  if (!allergies?.length) return `<div class="sreq"><div class="sreq-title">Special Request</div></div>`;
-  const items = allergies.slice(0, 6).map((r) => {
-    const room = r.room ?? r.room_number ?? "";
-    const note = r.allergies ?? r.allergy ?? r.notes ?? r.reason ?? "";
-    return `<div class="sreq-row"><span class="sreq-room">${esc(room)}</span><span class="sreq-note">${esc(note)}</span></div>`;
-  }).join("");
-  return `<div class="sreq"><div class="sreq-title">Special Request</div>${items}</div>`;
-}
+// Phase 28.7 (3 May 2026) — removed renderSpecialRequest() which duplicated
+// allergies_in_house at the top of the page AND in the main guest-table
+// section. User report: "allergies in-house appear in two separate places.
+// should be only one." The canonical surface is now renderGuestTable
+// "Allergies in-house" in the middle section. If a top-of-page allergy
+// summary tile is wanted later, build it from a DIFFERENT slice (e.g.,
+// only severe / first-night allergies) so it isn't a duplicate.
 
 function renderShowRooms(b: Briefing | null | undefined): string {
   const text = b?.show_rooms ?? "";
@@ -318,7 +314,6 @@ export function renderFlashPdfHtml(
     ${renderCalendar(reportDate)}
     ${renderWeather(payload.weather)}
     ${renderModCard(briefing)}
-    ${renderSpecialRequest(payload.allergies_in_house)}
   </div>
 
   <div class="top" style="grid-template-columns: 1fr 1fr; gap: 4mm; margin-bottom: 4mm;">
