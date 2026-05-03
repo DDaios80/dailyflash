@@ -896,7 +896,7 @@ function renderBirthdays(rows: any[]): string {
       <td style="padding:8px 10px;border-bottom:1px solid #f5e8c8;background:#fff8e6;font-weight:600;color:#a38a6a;white-space:nowrap;vertical-align:top">${escapeHtml(room)}</td>
       <td style="padding:8px 10px;border-bottom:1px solid #f5e8c8;background:#fff8e6">
         <div style="font-weight:500">${escapeHtml(name)}</div>
-        <div style="color:#9a3412;font-size:13px;margin-top:2px">🎂 ${escapeHtml(ageText)}${stayLine ? ` · ${stayLine}` : ""}</div>
+        <div style="color:#9a3412;font-size:13px;margin-top:2px">${escapeHtml(ageText)}${stayLine ? ` · ${stayLine}` : ""}</div>
       </td>
     </tr>`;
   }).join("");
