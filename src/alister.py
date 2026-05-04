@@ -44,6 +44,24 @@ ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(ENV_PATH, override=True)
 
 DEFAULT_MODEL = os.environ.get("DAILY_FLASH_MODEL", "claude-opus-4-7")
+
+# Phase 33 — A-lister cost cascade. The expensive pass is Pass 1 (research
+# with web_search) because each call returns ~30K tokens of search results
+# as input at $5/M for Opus. Pass 2 (disprove) is small — just challenges
+# Pass 1's reasoning. So we let Haiku 4.5 handle the bulky search step and
+# the initial classification, then escalate to Opus for the disprove.
+# Expected cost reduction: ~60% per fresh subject (~$80/mo savings at
+# 25-30 fresh subjects/day).
+#
+# Risks: Haiku is less nuanced on edge "is this person notable" calls,
+# but the Pass 2 disprove on Opus is the safety net — it knocks down
+# Haiku's over-eager notable=true with adversarial counter-evidence.
+#
+# Set ALISTER_CASCADE=1 in env to enable. Defaults to off (current
+# behaviour: both passes on Opus). Rollback: clear the env var.
+_ALISTER_CASCADE = os.environ.get("ALISTER_CASCADE") == "1"
+PASS1_MODEL = "claude-haiku-4-5" if _ALISTER_CASCADE else DEFAULT_MODEL
+PASS2_MODEL = DEFAULT_MODEL  # Always the canonical model (Opus 4.7) — disprove pass needs deep reasoning.
 DEFAULT_CONCURRENCY = int(os.environ.get("DAILY_FLASH_CONCURRENCY", "3"))
 DEFAULT_CONFIDENCE_THRESHOLD = 85  # raised from 70 after false-positive review
 DEFAULT_CACHE_TTL_DAYS = 180  # 6 months — repeater guests unlikely to change
@@ -528,11 +546,18 @@ async def _research_one(
     model: str,
     semaphore: asyncio.Semaphore,
 ) -> tuple[Subject, Optional[AListerFinding], Optional[str]]:
-    """Research one subject (2 passes: research + adversarial disprove)."""
+    """Research one subject (2 passes: research + adversarial disprove).
+
+    Phase 33 — when ALISTER_CASCADE=1, Pass 1 runs on PASS1_MODEL (Haiku 4.5)
+    and Pass 2 on PASS2_MODEL (Opus 4.7). When the env flag is off, both
+    passes run on `model` as before.
+    """
+    pass1_model = PASS1_MODEL if _ALISTER_CASCADE else model
+    pass2_model = PASS2_MODEL  # always canonical (Opus) — disprove needs nuance
     async with semaphore:
-        # Pass 1: research
+        # Pass 1: research (cheap model when cascade is on)
         text, err = await _claude_with_retry(
-            client, model=model,
+            client, model=pass1_model,
             system_prompt=SYSTEM_PROMPT,
             user_prompt=_user_prompt(subject),
         )
@@ -550,10 +575,12 @@ async def _research_one(
                 "reasoning": (finding.reasoning or "") + " [auto-rejected: no photo_url provided]",
             })
 
-        # Pass 2: disprove (only if pass 1 flagged notable — saves tokens)
+        # Pass 2: disprove (only if pass 1 flagged notable — saves tokens).
+        # Always runs on Opus (PASS2_MODEL) when cascade is on — this is the
+        # safety net that catches Haiku over-confidence in Pass 1.
         if finding.is_notable:
             dtext, derr = await _claude_with_retry(
-                client, model=model,
+                client, model=pass2_model,
                 system_prompt=DISPROVE_SYSTEM_PROMPT,
                 user_prompt=_disprove_user_prompt(subject, finding),
                 max_tokens=1500,
@@ -741,6 +768,11 @@ async def research_subjects(
     findings.extend(cache_hits)
 
     if to_research:
+        if _ALISTER_CASCADE:
+            print(
+                f"  ALISTER_CASCADE=1 — Pass 1 (research+web_search) on {PASS1_MODEL}, "
+                f"Pass 2 (disprove) on {PASS2_MODEL}"
+            )
         client = AsyncAnthropic(max_retries=5)
         semaphore = asyncio.Semaphore(concurrency)
         tasks = [_research_one(client, s, model, semaphore) for s in to_research]
