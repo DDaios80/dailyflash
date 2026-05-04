@@ -30,12 +30,28 @@ def _as_date(v: Any) -> date | None:
 
 def _arrives_on(r: dict[str, Any], d: date) -> bool:
     a = _as_date(r.get("arrival"))
-    return a == d
+    if a != d:
+        return False
+    # Phase 37 — continue-stay suppression. If this reservation's
+    # arrival date == another reservation's departure date in the same
+    # room for the same guest, it's an Opera stay extension, not a
+    # real arrival. Don't count it.
+    if r.get("_continue_stay_role") == "extension":
+        return False
+    return True
 
 
 def _departs_on(r: dict[str, Any], d: date) -> bool:
     dep = _as_date(r.get("departure"))
-    return dep == d
+    if dep != d:
+        return False
+    # Phase 37 — continue-stay suppression. If this reservation's
+    # departure date matches another reservation's arrival date in the
+    # same room for the same guest, the guest isn't leaving — they're
+    # continuing the stay under a new resv_name_id.
+    if r.get("_continue_stay_role") == "original":
+        return False
+    return True
 
 
 def _in_house_on(r: dict[str, Any], d: date) -> bool:
@@ -45,6 +61,78 @@ def _in_house_on(r: dict[str, Any], d: date) -> bool:
     if a is None or dep is None:
         return False
     return a <= d < dep
+
+
+# ─── Phase 37 — continue-stay detection ────────────────────────────────────
+# Opera issues a new resv_name_id when a guest extends their stay beyond
+# the original reservation's departure date. The same guest then looks
+# like a departure + arrival pair on the changeover date. From an
+# operational point of view they're a single continuous stay — they don't
+# check out and back in. The dashboard should reflect that.
+#
+# We detect pairs by same room + same guest where R1.departure ==
+# R2.arrival, then tag both reservations with `_continue_stay_role`:
+#   'original'  — R1 (the earlier one). Its departure is suppressed.
+#   'extension' — R2 (the later one).  Its arrival is suppressed.
+#
+# `in_house` is unaffected because both records are physically present
+# on the changeover date (R1 ends at noon, R2 starts at 3pm — same room,
+# same person, no checkout in practice).
+
+def _guest_match_key(r: dict[str, Any]) -> tuple:
+    """Stable key identifying the same person across reservation records.
+    Prefer guest_name_id (Opera's stable per-guest id). Fall back to
+    name + nationality when guest_name_id is missing."""
+    gnid = r.get("guest_name_id")
+    if gnid is not None:
+        return ("gnid", gnid)
+    last  = (r.get("guest_name") or "").strip().lower()
+    first = (r.get("guest_first_name") or "").strip().lower()
+    nat   = (r.get("guest_country") or r.get("nationality") or "").strip().lower()
+    return ("name", last, first, nat)
+
+
+def tag_continue_stay_pairs(records: list[dict[str, Any]]) -> int:
+    """Mutate `records` in place, tagging each member of a continue-stay
+    pair with `_continue_stay_role`. Returns the number of pairs found.
+
+    Pair condition:
+      - Same room (case-sensitive string match — Opera room codes are stable)
+      - Same guest (per `_guest_match_key`)
+      - R1.departure == R2.arrival as calendar dates
+    """
+    by_room_arrive: dict[tuple[str, date], list[dict[str, Any]]] = {}
+    for r in records:
+        room = r.get("room")
+        a_date = _as_date(r.get("arrival"))
+        if not room or a_date is None:
+            continue
+        by_room_arrive.setdefault((room, a_date), []).append(r)
+
+    pairs = 0
+    for r in records:
+        room = r.get("room")
+        d_date = _as_date(r.get("departure"))
+        if not room or d_date is None:
+            continue
+        # Look for any reservation arriving on r's departure date in the
+        # same room. If found and same guest, this is a continue-stay pair.
+        candidates = by_room_arrive.get((room, d_date)) or []
+        if not candidates:
+            continue
+        my_key = _guest_match_key(r)
+        for partner in candidates:
+            if partner is r:
+                continue
+            if _guest_match_key(partner) != my_key:
+                continue
+            # Found pair: r is the "original" (departing), partner is the
+            # "extension" (arriving on the same date).
+            r["_continue_stay_role"] = "original"
+            partner["_continue_stay_role"] = "extension"
+            pairs += 1
+            break  # one partner is enough; pairs are 1:1
+    return pairs
 
 
 # ─── Special attention rules ────────────────────────────────────────────────
@@ -453,6 +541,16 @@ def compute_flash(
     `promoted_rooms`: rooms manually promoted to special attention by Guest Relations.
     """
     promoted_rooms = promoted_rooms or set()
+
+    # Phase 37 — tag continue-stay reservation pairs (Opera issues a new
+    # resv_name_id when a guest extends their stay; without tagging,
+    # the same guest looks like a departure + arrival on the same day in
+    # the same room). _arrives_on / _departs_on suppress these tagged
+    # records so they don't inflate the arrival/departure counts or
+    # appear on the special-attention lists.
+    pairs_found = tag_continue_stay_pairs(records)
+    if pairs_found:
+        print(f"  Phase 37: tagged {pairs_found} continue-stay reservation pair(s)")
 
     tomorrow = report_date + timedelta(days=1)
     following = report_date + timedelta(days=2)
