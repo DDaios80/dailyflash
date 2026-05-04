@@ -160,6 +160,42 @@ COMMENT_ATTENTION_PHRASES = (
     "prize winner",
 )
 
+
+# Phase 38 — patterns identifying guests who are themselves travel-trade
+# representatives staying at the property (FAM trips, site inspections,
+# individual TA familiarisations). Distinct from regular guests booked
+# THROUGH a travel agent (every booking has a travel_agent_name; we
+# don't flag those). Operations want these flagged as "Special
+# Attention" so the team can wow them — happy stay = more bookings.
+TRAVEL_AGENT_GUEST_MARKET_PATTERNS = (
+    "FAM",        # "FAM TRIP", "FAM 2026"
+    "TRADE",      # "TRADE", "TRADE INVITATIONAL"
+    "INDUSTRY",   # "INDUSTRY", "INDUSTRY GUEST"
+)
+TRAVEL_AGENT_GUEST_COMMENT_PHRASES = (
+    "travel agent",
+    "ta visit",
+    "ta staying",
+    "ta stay",
+    "fam trip",
+    "site inspection",
+    "trade rep",
+    "trade visit",
+)
+
+
+def _is_travel_agent_guest(r: dict[str, Any]) -> bool:
+    """True if the guest is a travel-trade representative staying at the
+    property (FAM trip, site inspection, individual TA visit). Returns
+    false for regular guests booked through a travel agent."""
+    market = (r.get("market_desc") or "").upper()
+    if any(p in market for p in TRAVEL_AGENT_GUEST_MARKET_PATTERNS):
+        return True
+    c = (r.get("comments") or "").lower()
+    if c and any(p in c for p in TRAVEL_AGENT_GUEST_COMMENT_PHRASES):
+        return True
+    return False
+
 # Travel-agent / group names that warrant special attention on their own.
 # Kept tight to genuine luxury channels.
 # Pruning history (Daios Cove):
@@ -312,6 +348,13 @@ def special_attention_reason(r: dict[str, Any]) -> str | None:
         if kw in ta or kw in group:
             reasons.append(kw.title())
             break
+
+    # Phase 38 — travel-trade guests staying as themselves (FAM trips,
+    # site inspections, individual TA familiarisations). Detection via
+    # market_desc patterns + comments phrases. Distinct from regular
+    # guests booked THROUGH a TA.
+    if _is_travel_agent_guest(r):
+        reasons.append("Travel Agent")
 
     # De-dupe while preserving order
     seen: set[str] = set()
