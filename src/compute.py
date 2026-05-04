@@ -373,6 +373,13 @@ class FlashGuest:
     # PDF template's renderCommentsAppendix uses it when include_comments
     # is on.
     comments: str | None = None
+    # Phase 36 — party composition for the dashboard guest cards. Operations
+    # need the kid count + individual ages to plan kids-club staffing,
+    # restaurant high-chair allocation, breakfast counts, etc.
+    adults: int | None = None
+    children_count: int | None = None
+    children_ages: str | None = None   # raw Opera ages text, e.g. "3, 7"
+    cribs: int | None = None
 
 
 @dataclass
@@ -411,6 +418,11 @@ def _guest_payload(r: dict[str, Any]) -> dict[str, Any]:
         honeymoon="HON" in _special_request_codes(r),
         resv_name_id=r.get("resv_name_id"),
         comments=(r.get("comments") or None),
+        # Phase 36 — party composition
+        adults=r.get("adults"),
+        children_count=r.get("children"),
+        children_ages=(r.get("ages") or None),
+        cribs=r.get("cribs"),
     ))
 
 
