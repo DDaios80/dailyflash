@@ -257,6 +257,12 @@ class OccupancyDay:
     adults_only_guests: int = 0
     family_rooms: int = 0
     family_guests: int = 0
+    # Phase 36.1 — definitive totals for the dashboard's Kids + Cribs tiles.
+    # Sum across in-house reservations (room-deduped). The dashboard reads
+    # these directly instead of computing client-side (which had a bug
+    # showing "1" for 50 family rooms).
+    children_total: int = 0
+    cribs_total: int = 0
     # Room-category split. Standard / Suite (no Collection) / Collection / Villa.
     # Counts are room counts; the dashboard can derive percentages.
     rooms_by_category: dict[str, int] = field(default_factory=dict)
@@ -298,11 +304,17 @@ def occupancy_for_day(records: Iterable[dict[str, Any]], d: date, total_rooms: i
     # Phase 30 — party-composition + category breakdowns. Counted at room
     # level (not reservation level) so a guest sharing a room with an extra
     # bed isn't double-counted.
+    # Phase 36.1 — also sum the total kids and total cribs across in-house
+    # so the dashboard "Kids" tile reads from a definitive number rather
+    # than aggregating on the UI side (which had a bug producing "1" for
+    # 50 family rooms — wrong by 70x).
     rooms_seen: set[str] = set()
     adults_only_rooms = 0
     adults_only_guests = 0
     family_rooms = 0
     family_guests = 0
+    children_total = 0
+    cribs_total = 0
     rooms_by_category: dict[str, int] = {}
     for r in in_house:
         room = r.get("room")
@@ -310,6 +322,7 @@ def occupancy_for_day(records: Iterable[dict[str, Any]], d: date, total_rooms: i
             continue
         rooms_seen.add(room)
         children = int(r.get("children") or 0)
+        cribs = int(r.get("cribs") or 0)
         pax = int(r.get("pax") or 0)
         if children > 0:
             family_rooms += 1
@@ -317,6 +330,8 @@ def occupancy_for_day(records: Iterable[dict[str, Any]], d: date, total_rooms: i
         else:
             adults_only_rooms += 1
             adults_only_guests += pax
+        children_total += children
+        cribs_total += cribs
         bucket = _room_bucket(r.get("room_category_label") or r.get("booked_room_category_label"))
         rooms_by_category[bucket] = rooms_by_category.get(bucket, 0) + 1
 
@@ -332,6 +347,8 @@ def occupancy_for_day(records: Iterable[dict[str, Any]], d: date, total_rooms: i
         adults_only_guests=adults_only_guests,
         family_rooms=family_rooms,
         family_guests=family_guests,
+        children_total=children_total,
+        cribs_total=cribs_total,
         rooms_by_category=rooms_by_category,
     )
 
