@@ -94,6 +94,10 @@ def main() -> int:
                     help="Override: target today's date instead of tomorrow (useful for manual re-runs)")
     ap.add_argument("--fallback-latest", action="store_true",
                     help="If no dated file for the target date, use the newest xlsx in the inbox")
+    ap.add_argument("--quick", action="store_true",
+                    help="Skip slow steps (LLM extractions + A-lister research). For intra-day re-syncs after a room change. Existing extractions / findings stay attached via Phase 28.4 UPSERT, so the dashboard sees fresh occupancy + special-attention without a 5-min wait.")
+    ap.add_argument("--auto-quick", action="store_true",
+                    help="Polling mode: detect if OneDrive xlsx was modified after the last upload's uploaded_at, and only run quick pipeline if so. Use as a 15-30 min Railway cron to pick up Thelxi's intra-day room-change re-uploads automatically.")
     args = ap.parse_args()
 
     # Pipeline runs the night before at 23:00 local → default to TOMORROW.
@@ -172,11 +176,54 @@ def main() -> int:
                 birthdays_path = candidates[0]
                 print(f"[cron] local birthdays file: {birthdays_path.name}")
 
-    print(f"[cron] pipeline — date={target}, file={xlsx}")
+    # Phase 35 — auto-quick polling. Compare the OneDrive xlsx's
+    # lastModifiedDateTime against the latest uploads.uploaded_at. If
+    # OneDrive isn't newer, exit silently — nothing changed since the
+    # last cron. Used as a 15-30 min Railway poll job that picks up
+    # Thelxi's intra-day room-change re-exports without operator clicks.
+    if args.auto_quick:
+        try:
+            from datetime import timezone
+            xlsx_mtime = datetime.fromtimestamp(
+                Path(xlsx).stat().st_mtime, tz=timezone.utc,
+            )
+            from supa import client as _supa_client
+            sb = _supa_client()
+            rows = sb.table("uploads").select("uploaded_at").order(
+                "uploaded_at", desc=True,
+            ).limit(1).execute().data or []
+            last_upload_at = (
+                datetime.fromisoformat(rows[0]["uploaded_at"].replace("Z", "+00:00"))
+                if rows else None
+            )
+            if last_upload_at and xlsx_mtime <= last_upload_at:
+                print(
+                    f"[cron] auto-quick: OneDrive xlsx ({xlsx_mtime.isoformat()}) "
+                    f"is not newer than last upload ({last_upload_at.isoformat()}). "
+                    f"Nothing to do."
+                )
+                return 0
+            print(
+                f"[cron] auto-quick: OneDrive xlsx ({xlsx_mtime.isoformat()}) "
+                f"is newer than last upload "
+                f"({last_upload_at.isoformat() if last_upload_at else 'none'}). "
+                f"Running quick pipeline."
+            )
+            args.quick = True   # auto-quick implies --quick
+        except Exception as e:
+            print(
+                f"[cron] auto-quick check failed ({type(e).__name__}: {e}). "
+                f"Falling through to normal run.",
+                file=sys.stderr,
+            )
+
+    print(f"[cron] pipeline — date={target}, file={xlsx}{', QUICK MODE' if args.quick else ''}")
     from daily import run_daily
     try:
         run_daily(
             str(xlsx), target,
+            run_extract=not args.quick,
+            run_alister=not args.quick,
             birthdays_xlsx_path=str(birthdays_path) if birthdays_path else None,
         )
     except Exception as e:
