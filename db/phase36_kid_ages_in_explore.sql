@@ -13,8 +13,16 @@
 -- The Phase 31 explore_arrival_detail view already exposed `children` and
 -- `pax`. This phase adds `children_ages` and `cribs` so the dashboard
 -- can render guest cards with the full party composition.
+--
+-- Note: CREATE OR REPLACE VIEW only allows ADDING columns at the END of
+-- the column list — you can't insert in the middle. Since we want the
+-- new fields next to `children` semantically, we DROP and recreate.
+-- Safe: the view has no dependent objects (no other view, RPC, or table
+-- references explore_arrival_detail; the dashboard reads by column name).
 
-create or replace view explore_arrival_detail as
+drop view if exists explore_arrival_detail;
+
+create view explore_arrival_detail as
 select
   r.id as reservation_id,
   r.resv_name_id,
