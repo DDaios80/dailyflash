@@ -291,11 +291,47 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     return rec
 
 
+# Phase 39 — known-typo corrections applied at ingest time. The Opera
+# elements file occasionally exports "Reviwed" (missing the 'e' between
+# 'i' and 'w') instead of the correct "Reviewed". Rather than chase
+# downstream typos in dashboard / extractor / email templates, fix once
+# at the data boundary so every consumer sees the right spelling.
+#
+# Pattern preserves casing: 'Reviwed' -> 'Reviewed', 'REVIWED' ->
+# 'REVIEWED', 'reviwed' -> 'reviewed'. Word-bounded so we don't disturb
+# unrelated tokens.
+
+import re as _re_typo
+
+_TYPO_REVIWED = _re_typo.compile(r'\b(Rev)(i)(w)(ed)\b', _re_typo.IGNORECASE)
+
+
+def _fix_reviwed(text: str) -> str:
+    """Replace 'Reviwed' with 'Reviewed' (case-aware, word-bounded)."""
+    if not text or 'iw' not in text.lower():
+        return text
+    def _repl(m: _re_typo.Match) -> str:
+        rev, i_char, w_char, ed = m.group(1), m.group(2), m.group(3), m.group(4)
+        new_e = 'E' if i_char.isupper() else 'e'
+        return rev + i_char + new_e + w_char + ed
+    return _TYPO_REVIWED.sub(_repl, text)
+
+
+def _normalize_typos(record: dict[str, Any]) -> None:
+    """In-place typo corrections across every string field of a record."""
+    for key, value in record.items():
+        if isinstance(value, str) and value:
+            record[key] = _fix_reviwed(value)
+
+
 def parse_file(path: str | Path) -> list[dict[str, Any]]:
-    """End-to-end: load file → filter junk → normalize → dedupe → return records.
+    """End-to-end: load file → filter junk → normalize → fix typos → dedupe → return records.
 
     Opera exports occasionally duplicate a reservation verbatim. We keep the
     first occurrence of each resv_name_id.
+
+    Phase 39 — also runs known-typo corrections on every string field so
+    'Reviwed' from the Opera elements file lands in the DB as 'Reviewed'.
     """
     df = load_workbook(path)
     records: list[dict[str, Any]] = []
@@ -305,6 +341,7 @@ def parse_file(path: str | Path) -> list[dict[str, Any]]:
         if not is_real_reservation(row):
             continue
         rec = normalize_row(row)
+        _normalize_typos(rec)   # Phase 39 — fix Reviwed -> Reviewed
         rid = rec.get("resv_name_id")
         if rid is not None:
             if rid in seen_ids:
