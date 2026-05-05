@@ -46,6 +46,18 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 PIPELINE_SECRET = os.environ.get("PIPELINE_SECRET", "").strip()
 SEND_FLASH_EMAIL_URL = os.environ.get("SEND_FLASH_EMAIL_URL", "").strip()
 
+# Phase 41 — /reissue debounce. The bridge edge function calls /reissue
+# back at the end of every cron run (reason: "preview_already_sent"),
+# which spawns ANOTHER cron subprocess that re-ingests. With OneDrive
+# sometimes holding multiple dated xlsx files, the second ingest can
+# pick a different file and clobber the first run's data via the upload
+# UPSERT chain. Debounce: if the last successful run finished within
+# REISSUE_DEBOUNCE_SECONDS, skip re-running. Caller can override with
+# {"force": true} in body. Default 5 min — long enough to absorb the
+# bridge's loop, short enough that a genuine manual reissue 6 min later
+# still works.
+REISSUE_DEBOUNCE_SECONDS = int(os.environ.get("REISSUE_DEBOUNCE_SECONDS", "300"))
+
 # Single-slot run state. Protected by asyncio.Lock.
 _lock = asyncio.Lock()
 _current: dict[str, Any] | None = None
@@ -179,6 +191,35 @@ async def reissue(request: Request, authorization: str | None = Header(None)):
             pass
         if age_s > 900:
             _current = None  # treat as crashed
+
+    # Phase 41 — debounce. The bridge edge function calls /reissue at the
+    # end of every cron run, which would spawn another cron subprocess
+    # and race against the just-completed ingest. If the last successful
+    # run finished within the debounce window, skip — the data is already
+    # fresh. Caller can override with {"force": true}.
+    if not body.get("force") and _last is not None and _last.get("status") == "ok":
+        try:
+            finished = datetime.fromisoformat(
+                _last["finished_at"].replace("Z", "+00:00")
+            )
+            age_since_finish_s = (
+                datetime.now(timezone.utc) - finished
+            ).total_seconds()
+        except Exception:
+            age_since_finish_s = REISSUE_DEBOUNCE_SECONDS + 1
+        if age_since_finish_s < REISSUE_DEBOUNCE_SECONDS:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": (
+                    f"debounced: last successful run finished "
+                    f"{int(age_since_finish_s)}s ago "
+                    f"(< {REISSUE_DEBOUNCE_SECONDS}s threshold). "
+                    f"Pass force:true to override."
+                ),
+                "last_run_id": _last.get("run_id"),
+                "last_finished_at": _last.get("finished_at"),
+            }
 
     async with _lock:
         if _current is not None:
