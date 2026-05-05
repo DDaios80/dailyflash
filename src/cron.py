@@ -124,12 +124,21 @@ def main() -> int:
         )
         try:
             tmp = Path(os.environ.get("DAILY_FLASH_TMP", "/tmp/daily-flash"))
-            xlsx, is_stale = fetch_daily_flash_for_date(today_athens, tmp)
+            # Phase 40 — Thelxi's filename convention shifted from PREP date
+            # (today) to REPORT date (tomorrow). Try the report date first,
+            # then prep date for backward compat, before falling back to
+            # latest-modified.
+            xlsx, is_stale = fetch_daily_flash_for_date(target, tmp)
+            if is_stale:
+                xlsx2, is_stale2 = fetch_daily_flash_for_date(today_athens, tmp)
+                if not is_stale2:
+                    xlsx, is_stale = xlsx2, is_stale2
             tag = "STALE FALLBACK" if is_stale else "exact date match"
             print(f"[cron] pulled daily flash ({tag}): {xlsx.name}")
             if is_stale:
                 print(
-                    f"[cron] WARNING: no xlsx filename matched {today_athens.isoformat()} "
+                    f"[cron] WARNING: no xlsx filename matched {target.isoformat()} "
+                    f"or {today_athens.isoformat()} "
                     f"— using latest-modified '{xlsx.name}'. Operator may have forgotten "
                     f"to upload today's export.",
                     file=sys.stderr,
