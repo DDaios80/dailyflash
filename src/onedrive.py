@@ -270,6 +270,31 @@ def list_fam_trip_pdfs() -> list[dict]:
     return [it for it in items if (it.get("name") or "").lower().endswith(".pdf")]
 
 
+# ─── Phase 44 — Site inspection PDFs ──────────────────────────────────────
+
+def list_site_inspection_pdfs() -> list[dict]:
+    """List PDFs in {folder}/SITE INSPECTIONS/. Mirrors list_fam_trip_pdfs.
+    Skips non-PDF files (.msg/.eml Outlook exports are out of scope for now).
+    Returns [] if folder doesn't exist or has no PDFs.
+    """
+    cfg = _config()
+    token = _refresh_access_token(cfg)
+    headers = {"Authorization": f"Bearer {token}"}
+    folder_path = f"{cfg['folder']}/SITE INSPECTIONS"
+    list_url = (
+        f"{_GRAPH}/me/drive/root:/{folder_path}:/children"
+        "?$orderby=lastModifiedDateTime desc&$top=200"
+        "&$select=id,name,lastModifiedDateTime,size,@microsoft.graph.downloadUrl"
+    )
+    r = requests.get(list_url, headers=headers, timeout=30)
+    if r.status_code == 404:
+        return []
+    if r.status_code >= 400:
+        raise GraphError(f"SITE INSPECTIONS folder listing failed ({r.status_code}): {r.text[:500]}")
+    items = (r.json().get("value") or [])
+    return [it for it in items if (it.get("name") or "").lower().endswith(".pdf")]
+
+
 def download_pdf_bytes(item: dict) -> bytes:
     """Download a Graph PDF item directly to memory. The pipeline streams
     the bytes to the ingest edge function via base64 — no local disk write."""

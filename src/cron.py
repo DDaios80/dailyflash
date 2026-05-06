@@ -249,6 +249,16 @@ def main() -> int:
         print(f"[cron] fam-trip sync failed (non-fatal): {type(e).__name__}: {e}",
               file=sys.stderr)
 
+    # Phase 44 — sync site inspection PDFs from OneDrive.
+    # No-op until INGEST_SITE_INSPECTION_URL is wired up on the Lovable
+    # side. Best-effort: failures don't fail the cron.
+    try:
+        from site_inspection_sync import sync as inspection_sync
+        inspection_sync()
+    except Exception as e:
+        print(f"[cron] site-inspection sync failed (non-fatal): {type(e).__name__}: {e}",
+              file=sys.stderr)
+
     return 0
 
 
