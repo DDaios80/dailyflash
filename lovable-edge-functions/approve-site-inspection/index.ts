@@ -2,13 +2,12 @@
 //
 // GET /functions/v1/approve-site-inspection?token=<token>&action=approve|reject
 //
-// Phase 43 mirror of approve-fam-trip for the site_inspections table.
-// On approve, stamps sent_at = now() and emails the creator. On reject,
-// notifies the creator with the rejection.
+// Phase 43 — on approve, stamp sent_at = now() so the lifecycle is closed.
+// Phase 46 — on approve, fan out to the site inspection distribution list
+// pulled from app_settings.site_inspection_recipients (managed in /admin
+// → Distribution → Site Inspection Recipients).
 //
-// If a site-inspection approve handler already exists in Lovable, replace
-// it with this version (which fixes the sent_at NULL bug). If none
-// exists, create it as a new edge function.
+// Reject branch notifies the creator with rejection.
 
 import { createClient } from "npm:@supabase/supabase-js@2.104.0";
 
@@ -53,14 +52,24 @@ Deno.serve(async (req) => {
       .eq("id", inspection.id);
     if (updErr) return htmlPage(500, "Database error", updErr.message);
 
-    await sendConfirmationEmail(supa, inspection).catch((e) => {
-      console.error("approval confirmation email failed:", String((e as Error)?.message ?? e));
-    });
+    let recipientCount = 0;
+    let recipientFailures = 0;
+    try {
+      const result = await fanOutDistributionEmail(supa, inspection);
+      recipientCount = result.sent;
+      recipientFailures = result.failed;
+    } catch (e) {
+      console.error("Site inspection distribution fan-out failed:", String((e as Error)?.message ?? e));
+    }
+
+    const summary = recipientCount > 0
+      ? `Distribution email sent to ${recipientCount} recipient${recipientCount === 1 ? "" : "s"}${recipientFailures > 0 ? ` (${recipientFailures} failed)` : ""}.`
+      : `Distribution list could not be reached. The inspection is approved; verify the recipient list in /admin and resend manually if needed.`;
 
     return htmlPage(
       200,
       "Approved",
-      `The site inspection for <strong>${escapeHtml(inspection.travel_agency)}</strong> on ${escapeHtml(inspection.inspection_date)} is approved. The creator has been notified by email.`,
+      `The site inspection for <strong>${escapeHtml(inspection.travel_agency)}</strong> on ${escapeHtml(inspection.inspection_date)} is approved. ${summary}`,
     );
   }
 
@@ -85,8 +94,6 @@ async function resolveCreatorEmail(
   supa: ReturnType<typeof createClient>,
   creatorUserId: string,
 ): Promise<string | null> {
-  // Try the FAM trip approvers RPC first (likely covers the same admin/management set).
-  // Fall back to auth.admin.getUserById.
   try {
     const { data: approvers } = await supa.rpc("list_fam_trip_approvers");
     const match = (approvers ?? []).find(
@@ -103,44 +110,89 @@ async function resolveCreatorEmail(
   }
 }
 
-async function sendConfirmationEmail(
+// Phase 46 — fan out approved site inspections to the distribution list.
+async function fanOutDistributionEmail(
   supa: ReturnType<typeof createClient>,
   inspection: Record<string, unknown>,
-): Promise<void> {
+): Promise<{ sent: number; failed: number }> {
   const resendKey = Deno.env.get("RESEND_API_KEY");
   const fromAddress = Deno.env.get("EMAIL_FROM") ?? "Daios Cove Flash <flash@daioshotels.com>";
   const dashboardUrl = Deno.env.get("DASHBOARD_URL") ?? "https://flashreport.daioscove.com";
-  if (!resendKey || !inspection.created_by_user_id) return;
+  if (!resendKey) {
+    console.error("RESEND_API_KEY missing — cannot fan out");
+    return { sent: 0, failed: 0 };
+  }
 
-  const creatorEmail = await resolveCreatorEmail(supa, String(inspection.created_by_user_id));
-  if (!creatorEmail) return;
+  const { data: setting } = await supa
+    .from("app_settings")
+    .select("value")
+    .eq("key", "site_inspection_recipients")
+    .maybeSingle();
+  const raw = (setting?.value ?? "").toString();
+  const recipients = parseRecipientList(raw);
+  if (recipients.length === 0) {
+    console.error("site_inspection_recipients setting empty");
+    return { sent: 0, failed: 0 };
+  }
 
   const inspUrl = `${dashboardUrl}/site-inspections/${inspection.id}`;
   const agency = String(inspection.travel_agency ?? "");
   const date = String(inspection.inspection_date ?? "");
-  const approverName = String(inspection.approver_name ?? "the approver");
+  const time = inspection.inspection_time ? String(inspection.inspection_time) : "";
+  const numberOfPersons = inspection.number_of_persons ?? null;
+  const accompaniedByDmc = inspection.accompanied_by_dmc;
+  const sourceMarket = String(inspection.source_market ?? "");
+  const reason = String(inspection.reason_of_visit ?? "");
 
-  await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${resendKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from: fromAddress,
-      to: [creatorEmail],
-      subject: `[APPROVED] Site Inspection — ${agency}`,
-      html: `<!doctype html><html><body style="margin:0;padding:24px;background:#F8F5EE;font-family:-apple-system,sans-serif;color:#1a1a17;">
-        <div style="max-width:560px;margin:0 auto;background:#fff;padding:32px;border:1px solid #e5e0d3;">
-          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.18em;color:#999;margin-bottom:6px;">Daios Cove</div>
-          <h1 style="font-family:Georgia,serif;font-size:22px;margin:0 0 12px;color:#16a34a;">Site inspection approved</h1>
-          <p style="font-size:14px;line-height:1.5;">The site inspection for <strong>${escapeHtml(agency)}</strong> on ${escapeHtml(date)} was approved by ${escapeHtml(approverName)}.</p>
-          <p style="font-size:14px;line-height:1.5;">You can now share the inspection details with the operations team. Open the dashboard:</p>
-          <p style="margin-top:20px;"><a href="${inspUrl}" style="display:inline-block;padding:10px 22px;background:#1a1a17;color:#fff;text-decoration:none;font-size:14px;">Open inspection</a></p>
-        </div>
-      </body></html>`,
-    }),
-  });
+  const html = `<!doctype html><html><body style="margin:0;padding:24px;background:#F8F5EE;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a17;">
+    <div style="max-width:600px;margin:0 auto;background:#fff;padding:32px;border:1px solid #e5e0d3;">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.18em;color:#999;margin-bottom:8px;">Daios Cove · Site Inspection</div>
+      <h1 style="font-family:Georgia,serif;font-size:24px;margin:0 0 16px;">${escapeHtml(agency)}</h1>
+      <table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6;">
+        <tr><td style="padding:6px 0;color:#666;width:140px;">Inspection date</td><td>${escapeHtml(date)}${time ? " at " + escapeHtml(time) : ""}</td></tr>
+        ${reason ? `<tr><td style="padding:6px 0;color:#666;">Reason</td><td>${escapeHtml(reason)}</td></tr>` : ""}
+        ${numberOfPersons ? `<tr><td style="padding:6px 0;color:#666;">Number of persons</td><td>${escapeHtml(String(numberOfPersons))}</td></tr>` : ""}
+        ${typeof accompaniedByDmc === "boolean" ? `<tr><td style="padding:6px 0;color:#666;">Accompanied by DMC</td><td>${accompaniedByDmc ? "Yes" : "No"}</td></tr>` : ""}
+        ${sourceMarket ? `<tr><td style="padding:6px 0;color:#666;">Source market</td><td>${escapeHtml(sourceMarket)}</td></tr>` : ""}
+      </table>
+      <p style="font-size:14px;line-height:1.5;margin-top:24px;">Full inspection details, attendees, and attachment in the dashboard:</p>
+      <p style="margin-top:16px;"><a href="${inspUrl}" style="display:inline-block;padding:10px 22px;background:#1a1a17;color:#fff;text-decoration:none;font-size:14px;">Open inspection</a></p>
+      <p style="font-size:12px;color:#999;margin-top:32px;">You're receiving this because you're on the site inspection distribution list. To update, contact the admin team.</p>
+    </div>
+  </body></html>`;
+
+  const subject = `[SITE INSPECTION] ${agency} — ${date}`;
+  let sent = 0;
+  let failed = 0;
+
+  for (const chunk of chunked(recipients, 50)) {
+    try {
+      const r = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${resendKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: fromAddress,
+          to: chunk,
+          subject,
+          html,
+        }),
+      });
+      if (r.ok) {
+        sent += chunk.length;
+      } else {
+        failed += chunk.length;
+        console.error(`Resend chunk failed (${r.status}):`, await r.text().catch(() => ""));
+      }
+    } catch (e) {
+      failed += chunk.length;
+      console.error("Resend chunk exception:", String((e as Error)?.message ?? e));
+    }
+  }
+
+  return { sent, failed };
 }
 
 async function sendRejectionEmail(
@@ -180,6 +232,22 @@ async function sendRejectionEmail(
       </body></html>`,
     }),
   });
+}
+
+function parseRecipientList(raw: string): string[] {
+  const matches = raw.match(/<([^<>\s]+@[^<>\s]+)>|(\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b)/g) ?? [];
+  const out = new Set<string>();
+  for (const m of matches) {
+    const email = m.replace(/^</, "").replace(/>$/, "").toLowerCase().trim();
+    if (email.includes("@") && email.includes(".")) out.add(email);
+  }
+  return Array.from(out);
+}
+
+function chunked<T>(arr: T[], n: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
 }
 
 function htmlPage(status: number, heading: string, body: string): Response {

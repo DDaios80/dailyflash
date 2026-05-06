@@ -2,16 +2,14 @@
 //
 // GET /functions/v1/approve-fam-trip?token=<token>&action=approve|reject
 //
-// Phase 43 — on approve, also fire a confirmation email to the creator
-// AND stamp sent_at = now(). Previously the approve branch only updated
-// status + approved_at and showed a "you can now send to distribution
-// list" page, but there was no Send button anywhere; sent_at stayed
-// NULL forever and operations never received the FAM trip details.
+// Phase 43 — on approve, stamp sent_at = now() so the lifecycle is closed.
+// Phase 46 — on approve, fan out to the FAM trip distribution list pulled
+// from app_settings.fam_trip_recipients (same source the admin manages
+// via /admin → Distribution → FAM Trip Recipients). The recipient format
+// is "Name <email>; Name <email>; ..." (RFC 5322 ish). Recipients see
+// approved trip name, dates, and a dashboard link to grab the PDF.
 //
-// The reject branch already had a creator-notification pattern; the
-// approve branch now mirrors it. A proper distribution-list integration
-// is a future phase — for now, the creator gets the confirmation and
-// can manually forward, which closes the loop on the lifecycle stamp.
+// Reject branch unchanged: still notifies the creator with the rejection.
 
 import { createClient } from "npm:@supabase/supabase-js@2.104.0";
 
@@ -58,15 +56,25 @@ Deno.serve(async (req) => {
       .eq("id", trip.id);
     if (updErr) return htmlPage(500, "Database error", updErr.message);
 
-    // Best-effort: notify the creator that approval landed.
-    await sendConfirmationEmail(supa, trip).catch((e) => {
-      console.error("approval confirmation email failed:", String((e as Error)?.message ?? e));
-    });
+    // Phase 46 — fan out to the FAM trip distribution list.
+    let recipientCount = 0;
+    let recipientFailures = 0;
+    try {
+      const result = await fanOutDistributionEmail(supa, trip);
+      recipientCount = result.sent;
+      recipientFailures = result.failed;
+    } catch (e) {
+      console.error("FAM distribution fan-out failed:", String((e as Error)?.message ?? e));
+    }
+
+    const summary = recipientCount > 0
+      ? `Distribution email sent to ${recipientCount} recipient${recipientCount === 1 ? "" : "s"}${recipientFailures > 0 ? ` (${recipientFailures} failed)` : ""}.`
+      : `Distribution list could not be reached. The trip is approved; verify the recipient list in /admin and resend manually if needed.`;
 
     return htmlPage(
       200,
       "Approved",
-      `The FAM trip <strong>${escapeHtml(trip.name)}</strong> (${escapeHtml(trip.start_date)} → ${escapeHtml(trip.end_date)}) is approved. The creator has been notified by email.`,
+      `The FAM trip <strong>${escapeHtml(trip.name)}</strong> (${escapeHtml(trip.start_date)} → ${escapeHtml(trip.end_date)}) is approved. ${summary}`,
     );
   }
 
@@ -115,52 +123,107 @@ Deno.serve(async (req) => {
   );
 });
 
-// Phase 43 — confirmation email on approve. Same Resend pattern as the
-// reject branch. Uses list_fam_trip_approvers to resolve the creator's
-// email (the RPC includes management/admin/staff who could create trips).
-async function sendConfirmationEmail(
+// Phase 46 — parse "Name <email>; Name <email>;" format from app_settings
+// and chunk-send via Resend. Returns { sent, failed } per delivery.
+async function fanOutDistributionEmail(
   supa: ReturnType<typeof createClient>,
   trip: Record<string, unknown>,
-): Promise<void> {
+): Promise<{ sent: number; failed: number }> {
   const resendKey = Deno.env.get("RESEND_API_KEY");
   const fromAddress = Deno.env.get("EMAIL_FROM") ?? "Daios Cove Flash <flash@daioshotels.com>";
   const dashboardUrl = Deno.env.get("DASHBOARD_URL") ?? "https://flashreport.daioscove.com";
-  if (!resendKey || !trip.created_by_user_id) return;
+  if (!resendKey) {
+    console.error("RESEND_API_KEY missing — cannot fan out");
+    return { sent: 0, failed: 0 };
+  }
 
-  const { data: approvers } = await supa.rpc("list_fam_trip_approvers");
-  const fromApprovers = (approvers ?? []).find(
-    (a: { user_id: string }) => a.user_id === trip.created_by_user_id,
-  );
-  const creatorEmail = fromApprovers?.email;
-  if (!creatorEmail) return;
+  const { data: setting } = await supa
+    .from("app_settings")
+    .select("value")
+    .eq("key", "fam_trip_recipients")
+    .maybeSingle();
+  const raw = (setting?.value ?? "").toString();
+  const recipients = parseRecipientList(raw);
+  if (recipients.length === 0) {
+    console.error("fam_trip_recipients setting empty");
+    return { sent: 0, failed: 0 };
+  }
 
   const tripUrl = `${dashboardUrl}/fam-trips/${trip.id}`;
   const name = String(trip.name ?? "");
   const start = String(trip.start_date ?? "");
   const end = String(trip.end_date ?? "");
-  const approverName = String(trip.approver_name ?? "the approver");
+  const totalPax = trip.total_pax ?? null;
+  const sourceMarket = String(trip.source_market ?? "");
+  const inCharge = String(trip.in_charge ?? "");
 
-  await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${resendKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from: fromAddress,
-      to: [creatorEmail],
-      subject: `[APPROVED] FAM Trip — ${name}`,
-      html: `<!doctype html><html><body style="margin:0;padding:24px;background:#F8F5EE;font-family:-apple-system,sans-serif;color:#1a1a17;">
-        <div style="max-width:560px;margin:0 auto;background:#fff;padding:32px;border:1px solid #e5e0d3;">
-          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.18em;color:#999;margin-bottom:6px;">Daios Cove</div>
-          <h1 style="font-family:Georgia,serif;font-size:22px;margin:0 0 12px;color:#16a34a;">FAM trip approved</h1>
-          <p style="font-size:14px;line-height:1.5;"><strong>${escapeHtml(name)}</strong> (${escapeHtml(start)} → ${escapeHtml(end)}) was approved by ${escapeHtml(approverName)}.</p>
-          <p style="font-size:14px;line-height:1.5;">You can now share the FAM trip with the operations team and the agency contact. Open the dashboard to download the PDF and copy the briefing details:</p>
-          <p style="margin-top:20px;"><a href="${tripUrl}" style="display:inline-block;padding:10px 22px;background:#1a1a17;color:#fff;text-decoration:none;font-size:14px;">Open trip</a></p>
-        </div>
-      </body></html>`,
-    }),
-  });
+  const html = `<!doctype html><html><body style="margin:0;padding:24px;background:#F8F5EE;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a17;">
+    <div style="max-width:600px;margin:0 auto;background:#fff;padding:32px;border:1px solid #e5e0d3;">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.18em;color:#999;margin-bottom:8px;">Daios Cove · FAM Trip</div>
+      <h1 style="font-family:Georgia,serif;font-size:24px;margin:0 0 16px;">${escapeHtml(name)}</h1>
+      <table style="width:100%;border-collapse:collapse;font-size:14px;line-height:1.6;">
+        <tr><td style="padding:6px 0;color:#666;width:140px;">Dates</td><td>${escapeHtml(start)} → ${escapeHtml(end)}</td></tr>
+        ${totalPax ? `<tr><td style="padding:6px 0;color:#666;">Pax</td><td>${escapeHtml(String(totalPax))}</td></tr>` : ""}
+        ${sourceMarket ? `<tr><td style="padding:6px 0;color:#666;">Source market</td><td>${escapeHtml(sourceMarket)}</td></tr>` : ""}
+        ${inCharge ? `<tr><td style="padding:6px 0;color:#666;">In charge</td><td>${escapeHtml(inCharge)}</td></tr>` : ""}
+      </table>
+      <p style="font-size:14px;line-height:1.5;margin-top:24px;">Full briefing, room plan, and itinerary in the dashboard:</p>
+      <p style="margin-top:16px;"><a href="${tripUrl}" style="display:inline-block;padding:10px 22px;background:#1a1a17;color:#fff;text-decoration:none;font-size:14px;">Open FAM trip</a></p>
+      <p style="font-size:12px;color:#999;margin-top:32px;">You're receiving this because you're on the FAM trip distribution list. To update, contact the admin team.</p>
+    </div>
+  </body></html>`;
+
+  const subject = `[FAM TRIP] ${name} — ${start} → ${end}`;
+  let sent = 0;
+  let failed = 0;
+
+  // Chunk to 50 recipients per Resend call (Resend default `to:` array limit).
+  for (const chunk of chunked(recipients, 50)) {
+    try {
+      const r = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${resendKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: fromAddress,
+          to: chunk,
+          subject,
+          html,
+        }),
+      });
+      if (r.ok) {
+        sent += chunk.length;
+      } else {
+        failed += chunk.length;
+        console.error(`Resend chunk failed (${r.status}):`, await r.text().catch(() => ""));
+      }
+    } catch (e) {
+      failed += chunk.length;
+      console.error("Resend chunk exception:", String((e as Error)?.message ?? e));
+    }
+  }
+
+  return { sent, failed };
+}
+
+// Parse "Name <email>; Name <email>;" or comma-separated or one-per-line.
+// Returns lowercase, deduped, valid-looking email addresses.
+function parseRecipientList(raw: string): string[] {
+  const matches = raw.match(/<([^<>\s]+@[^<>\s]+)>|(\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b)/g) ?? [];
+  const out = new Set<string>();
+  for (const m of matches) {
+    const email = m.replace(/^</, "").replace(/>$/, "").toLowerCase().trim();
+    if (email.includes("@") && email.includes(".")) out.add(email);
+  }
+  return Array.from(out);
+}
+
+function chunked<T>(arr: T[], n: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
 }
 
 function htmlPage(status: number, heading: string, body: string): Response {

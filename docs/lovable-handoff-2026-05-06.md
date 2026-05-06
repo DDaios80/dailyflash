@@ -22,16 +22,20 @@ deployment steps.
    - Paste contents of `lovable-edge-functions/ingest-site-inspection-from-onedrive/index.ts`
    - Deploy
 
-5. **Phase 43 approve-fam-trip patch** — replace the existing
+5. **Phase 43 + 46 approve-fam-trip patch** — replace the existing
    `approve-fam-trip` edge function with the patched version at
-   `lovable-edge-functions/approve-fam-trip/index.ts`. The diff is small:
-   the approve branch now stamps `sent_at = now()` and fires a
-   confirmation email to the creator (mirroring the reject branch's
-   notification pattern).
+   `lovable-edge-functions/approve-fam-trip/index.ts`. Two changes from
+   the original: (a) approve branch stamps `sent_at = now()` (Phase 43),
+   (b) approve branch fans the FAM trip details out to the full
+   distribution list pulled from `app_settings.fam_trip_recipients`
+   (Phase 46) — same list managed in `/admin → Distribution → FAM Trip Recipients`.
+   Recipient parsing handles `Name <email>; Name <email>;` format.
+   Reject branch unchanged.
 
-6. **Phase 43 approve-site-inspection** — create or replace
+6. **Phase 43 + 46 approve-site-inspection** — create or replace
    `approve-site-inspection` with `lovable-edge-functions/approve-site-inspection/index.ts`.
-   Mirror of approve-fam-trip but for the site_inspections table.
+   Same pattern: stamps sent_at, fans to `app_settings.site_inspection_recipients`
+   (~58 emails), reject notifies creator.
 
 7. **Railway env var** — on both `dailyflash` and `fortunate-mindfulness`
    services, add:
