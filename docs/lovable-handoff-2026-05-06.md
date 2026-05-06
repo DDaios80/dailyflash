@@ -1,7 +1,50 @@
 # Lovable handoff — Phase 43 + 44 edge function work
 
-Two bugs the Python repo can't reach. Both live in Supabase edge functions
-on Lovable's side.
+Both fixes are now ready as code in this repo. This doc lists the
+deployment steps.
+
+## Deployment order (single sitting, ~5 min)
+
+1. **Phase 45 trigger** — run `db/phase45_approver_default_thelxi.sql`
+   in Lovable's SQL editor. Auto-reassigns d.daios → Thelxi on every
+   future INSERT.
+
+2. **Phase 44 storage bucket** — run `db/phase44_site_inspection_pdfs_bucket.sql`.
+   Creates the site-inspection-pdfs bucket with the same 4 policies as
+   fam-trip-pdfs.
+
+3. **Phase 43 backfill** — run `db/phase43_backfill_sent_at.sql`.
+   Stamps sent_at = approved_at on the historical rows that the broken
+   approve-fam-trip handler left null.
+
+4. **Phase 44 ingest edge function** — in Lovable Cloud → Edge Functions:
+   - Create new function `ingest-site-inspection-from-onedrive`
+   - Paste contents of `lovable-edge-functions/ingest-site-inspection-from-onedrive/index.ts`
+   - Deploy
+
+5. **Phase 43 approve-fam-trip patch** — replace the existing
+   `approve-fam-trip` edge function with the patched version at
+   `lovable-edge-functions/approve-fam-trip/index.ts`. The diff is small:
+   the approve branch now stamps `sent_at = now()` and fires a
+   confirmation email to the creator (mirroring the reject branch's
+   notification pattern).
+
+6. **Phase 43 approve-site-inspection** — create or replace
+   `approve-site-inspection` with `lovable-edge-functions/approve-site-inspection/index.ts`.
+   Mirror of approve-fam-trip but for the site_inspections table.
+
+7. **Railway env var** — on both `dailyflash` and `fortunate-mindfulness`
+   services, add:
+   `INGEST_SITE_INSPECTION_URL=https://<project>.supabase.co/functions/v1/ingest-site-inspection-from-onedrive`
+
+After step 7 the next nightly cron picks up site inspection PDFs from
+DailyFlash/SITE INSPECTIONS/ automatically.
+
+## What this ships
+
+Two bugs the Python repo couldn't reach. Both live in Supabase edge
+functions on Lovable's side. Code is now committed in
+`lovable-edge-functions/` for manual deployment via Lovable's UI.
 
 ## Phase 43 — Post-submit email send hook is broken
 
