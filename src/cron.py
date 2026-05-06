@@ -98,7 +98,52 @@ def main() -> int:
                     help="Skip slow steps (LLM extractions + A-lister research). For intra-day re-syncs after a room change. Existing extractions / findings stay attached via Phase 28.4 UPSERT, so the dashboard sees fresh occupancy + special-attention without a 5-min wait.")
     ap.add_argument("--auto-quick", action="store_true",
                     help="Polling mode: detect if OneDrive xlsx was modified after the last upload's uploaded_at, and only run quick pipeline if so. Use as a 15-30 min Railway cron to pick up Thelxi's intra-day room-change re-uploads automatically.")
+    ap.add_argument("--force", action="store_true",
+                    help="Bypass Phase 47 deploy-skip check (run even if RAILWAY_DEPLOYMENT_ID just changed).")
     args = ap.parse_args()
+
+    # Phase 47 — skip cron runs triggered by Railway redeploys. Railway's
+    # cron service fires the start command on every deploy AND on the
+    # configured schedule. Without this guard, every git push to main
+    # double-runs the pipeline (waste + reissue email spam to Thelxi).
+    #
+    # Mechanism: store the current RAILWAY_DEPLOYMENT_ID in app_settings.
+    # If env's deployment_id doesn't match what we stored, this is a
+    # fresh deploy — persist the new ID and exit. The next scheduled fire
+    # will see matching IDs and proceed.
+    #
+    # --force bypasses this. Local runs without RAILWAY_DEPLOYMENT_ID set
+    # also bypass (the env var is only present on Railway).
+    if not args.force and os.environ.get("RAILWAY_DEPLOYMENT_ID"):
+        deployment_id = os.environ["RAILWAY_DEPLOYMENT_ID"]
+        try:
+            from supa import client as _supa_client
+            _sb = _supa_client()
+            _row = (
+                _sb.table("app_settings")
+                .select("value")
+                .eq("key", "cron_last_deployment_id")
+                .maybe_single()
+                .execute()
+            )
+            _stored = (_row.data or {}).get("value") if _row else None
+            if _stored != deployment_id:
+                _sb.table("app_settings").upsert(
+                    {"key": "cron_last_deployment_id", "value": deployment_id},
+                    on_conflict="key",
+                ).execute()
+                print(
+                    f"[cron] Phase 47 deploy-skip: RAILWAY_DEPLOYMENT_ID changed "
+                    f"({_stored} → {deployment_id}). Skipping this run; "
+                    f"next scheduled fire will run normally."
+                )
+                return 0
+        except Exception as _e:
+            print(
+                f"[cron] Phase 47 deploy-skip check failed (continuing): "
+                f"{type(_e).__name__}: {_e}",
+                file=sys.stderr,
+            )
 
     # Pipeline runs the night before at 23:00 local → default to TOMORROW.
     # Manual re-runs for today's flash use --today.
