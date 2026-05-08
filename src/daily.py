@@ -358,25 +358,97 @@ def run_daily(
         print(f"[4b/5] zoho fetch failed (continuing without it): {e}")
         zoho_data = {}
 
-    # Phase 50 — fetch pool heating data from explore_pool_heating RPC
-    # so the dashboard's cached flash_report.payload.pool_heating list is
-    # populated with Phase 49 category-aware results, not always empty.
-    # The dashboard reads from this cached list (not the live RPC), so
-    # without this step the Pool Heating panel shows 0 rows for every
-    # day.
+    # Phase 50.1 — fetch pool heating data by querying the
+    # explore_arrival_detail view directly and applying Phase 49 room-
+    # category rules in Python. We previously called the
+    # explore_pool_heating RPC, but Lovable's PostgREST schema cache
+    # stays stale after the function gets recreated (CREATE OR REPLACE
+    # via SQL editor doesn't always trigger a reload). Going through
+    # the view bypasses the cache issue and is also more debuggable.
     pool_heating_data: list[dict] = []
     try:
+        from collections import defaultdict
         from supa import client as _supa_client
         _sb = _supa_client()
         _end_date = report_date + timedelta(days=14)
-        _resp = _sb.rpc("explore_pool_heating", {
-            "p_start": report_date.isoformat(),
-            "p_end": _end_date.isoformat(),
-        }).execute()
-        pool_heating_data = _resp.data or []
+        _resp = (
+            _sb.from_("explore_arrival_detail")
+            .select(
+                "room, guest_first_name, guest_name, room_category_label, "
+                "arrival_date, departure_date, nights, pool_fence, ce_pool_heating"
+            )
+            .lte("arrival_date", _end_date.isoformat())
+            .gte("departure_date", report_date.isoformat())
+            .execute()
+        )
+        _raw_rows = _resp.data or []
+
+        def _effective_pool_heating(category: str | None, ce_flag) -> bool:
+            """Phase 49 — category-based heating rules."""
+            cat = (category or "").upper()
+            if cat.startswith("V"):
+                return True   # Villas always heated, action required
+            if cat.startswith("C"):
+                return False  # Collection: heated by package, no action
+            if cat in ("DLXP", "DJSTEP"):
+                return False  # Pool exists but never heatable
+            if cat in ("JSTEP", "STEP"):
+                return bool(ce_flag)  # On request via comment
+            return False  # No private pool
+
+        # Filter to dashboard-eligible rows (heating action OR fence request)
+        _filtered: list[dict] = []
+        for r in _raw_rows:
+            eff = _effective_pool_heating(
+                r.get("room_category_label"), r.get("ce_pool_heating")
+            )
+            if eff or r.get("pool_fence"):
+                _filtered.append({**r, "_effective_pool_heating": eff})
+
+        # Group by room (Phase 31.1 dedup — combine same-room reservations)
+        _by_room: dict[str, list[dict]] = defaultdict(list)
+        for r in _filtered:
+            room = r.get("room")
+            if room:
+                _by_room[room].append(r)
+
+        for room, rows in _by_room.items():
+            full_names = sorted(set(
+                (
+                    (r.get("guest_first_name") or "").strip()
+                    + " "
+                    + (r.get("guest_name") or "").strip()
+                ).strip() or (r.get("guest_name") or "")
+                for r in rows
+            ))
+            guests = sorted({
+                (r.get("guest_name") or "").strip()
+                for r in rows
+                if r.get("guest_name")
+            })
+            pool_heating_data.append({
+                "room": room,
+                "guest_name": guests[0] if guests else None,
+                "guests": guests,
+                "full_names": full_names,
+                "occupants": len(full_names),
+                "arrival": min(r.get("arrival_date") for r in rows),
+                "departure": max(r.get("departure_date") for r in rows),
+                "nights": max((r.get("nights") or 0) for r in rows),
+                "room_category_label": next(
+                    (r.get("room_category_label") for r in rows), None
+                ),
+                "pool_heating": any(r["_effective_pool_heating"] for r in rows),
+                "pool_fence": any(r.get("pool_fence") for r in rows),
+            })
+
+        pool_heating_data.sort(
+            key=lambda x: ((x.get("arrival") or ""), (x.get("room") or ""))
+        )
         print(
             f"[4c/5] Pool heating: {len(pool_heating_data)} rooms over "
-            f"{report_date} → {_end_date}"
+            f"{report_date} → {_end_date} "
+            f"({len(_raw_rows)} raw rows, {len(_filtered)} eligible)"
         )
     except Exception as _e:
         print(
