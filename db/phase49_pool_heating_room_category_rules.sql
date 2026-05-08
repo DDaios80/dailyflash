@@ -50,8 +50,10 @@ as $$
         when upper(coalesce(ead.room_category_label, '')) like 'V%' then true
         -- Collection suites: heated by package, no dashboard action.
         when upper(coalesce(ead.room_category_label, '')) like 'C%' then false
-        -- DLXP and DJSTEP: pool exists but never heatable.
-        when upper(coalesce(ead.room_category_label, '')) in ('DLXP', 'DJSTEP') then false
+        -- DLXP and DJSTE (Deluxe Junior Suite w/ pool): pool exists but
+        -- never heatable. Both DJSTE and DJSTEP listed for safety; only
+        -- DJSTE has been observed in production data so far.
+        when upper(coalesce(ead.room_category_label, '')) in ('DLXP', 'DJSTE', 'DJSTEP') then false
         -- JSTEP and STEP: heated only if comment mentions it.
         when upper(coalesce(ead.room_category_label, '')) in ('JSTEP', 'STEP')
           then coalesce(ead.ce_pool_heating, false)
@@ -114,7 +116,7 @@ select
     else 'Other (SHOULD NOT APPEAR)'
   end as bucket,
   count(*)
-from jsonb_to_recordset(explore_pool_heating(current_date, current_date + interval '14 days'))
+from jsonb_to_recordset(explore_pool_heating(current_date, (current_date + interval '14 days')::date))
   as t(room text, room_category_label text)
 group by 1
 order by 1;
