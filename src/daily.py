@@ -313,18 +313,111 @@ def run_daily(
         extractions, errors, es = asyncio.run(extract_batch(in_scope))
         extractions_by_rnid = {rid: ext.model_dump() for rid, ext in extractions.items()}
 
-        # Phase 48 — capture the comment hashes used for this extraction.
-        # Persisted to comment_extractions.comment_hash AFTER the bridge
-        # POST so the next cron run can detect changes.
-        rnid_to_record = {r.get("resv_name_id"): r for r in in_scope}
-        for rnid in extractions_by_rnid:
-            rec = rnid_to_record.get(rnid)
-            if rec is not None:
-                extracted_comment_hashes[rnid] = hash_comment(rec.get("comments"))
-
         print(f"       {es['succeeded']}/{es['total']} ok, {es['failed']} failed")
     else:
         print(f"[2/5] --no-extract (skipped)")
+
+    # Phase 52 — preserve comment_extractions across upload replacement.
+    # When run_extract is False (--quick mode), no new extractions are
+    # generated. The bridge's _replace_existing_upload then cascade-
+    # deletes the prior reservations and their comment_extractions,
+    # leaving the new reservations bare. Result: in-house notes
+    # disappear from the dashboard until the next full nightly cron.
+    #
+    # Fix: fetch existing comment_extractions from DB before bridge
+    # call, populate extractions_by_rnid with them. Bridge then re-
+    # inserts them attached to the new reservation_ids via the
+    # resv_name_id mapping. No data loss across daily uploads.
+    #
+    # Best-effort. If the DB fetch fails (RLS, network), we fall
+    # through to the old behaviour — no preservation, but no breakage.
+    if not extractions_by_rnid:
+        try:
+            from supa import client as _supa_client
+            _sb = _supa_client()
+            _all_rnids = [
+                r.get("resv_name_id") for r in records
+                if r.get("resv_name_id") is not None
+            ]
+            _preserved: dict[int, dict] = {}
+            for _i in range(0, len(_all_rnids), 500):
+                _chunk = _all_rnids[_i : _i + 500]
+                # Step 1 — get reservation_id ↔ resv_name_id mapping
+                _rmap_rows = (
+                    _sb.from_("reservations")
+                    .select("id, resv_name_id")
+                    .in_("resv_name_id", _chunk)
+                    .execute()
+                    .data
+                    or []
+                )
+                _rid_to_rnid: dict[str, int] = {
+                    row["id"]: row["resv_name_id"]
+                    for row in _rmap_rows
+                    if row.get("id") and row.get("resv_name_id") is not None
+                }
+                if not _rid_to_rnid:
+                    continue
+                # Step 2 — fetch existing extractions for those reservation_ids
+                _ce_rows = (
+                    _sb.from_("comment_extractions")
+                    .select(
+                        "reservation_id, allergies_present, allergies_text, "
+                        "pool_fence, pool_heating, free_transfer, free_upgrade, "
+                        "lco, honeymoon, amenities, ops_notes"
+                    )
+                    .in_("reservation_id", list(_rid_to_rnid.keys()))
+                    .execute()
+                    .data
+                    or []
+                )
+                # Step 3 — map back to resv_name_id, build extraction dict
+                for _ce in _ce_rows:
+                    _rid = _ce.get("reservation_id")
+                    _rnid = _rid_to_rnid.get(_rid)
+                    if _rnid is None:
+                        continue
+                    _preserved[_rnid] = {
+                        "allergies_present": _ce.get("allergies_present"),
+                        "allergies_text": _ce.get("allergies_text"),
+                        "pool_fence": _ce.get("pool_fence"),
+                        "pool_heating": _ce.get("pool_heating"),
+                        "free_transfer": _ce.get("free_transfer"),
+                        "free_upgrade": _ce.get("free_upgrade"),
+                        # Bridge maps "lco" through; some legacy paths
+                        # accept either "lco" or "late_checkout".
+                        "lco": _ce.get("lco"),
+                        "late_checkout": _ce.get("lco"),
+                        "honeymoon": _ce.get("honeymoon"),
+                        "amenities": _ce.get("amenities") or [],
+                        "ops_notes": _ce.get("ops_notes"),
+                    }
+            if _preserved:
+                extractions_by_rnid = _preserved
+                print(
+                    f"       Phase 52: preserved {len(_preserved)} "
+                    f"comment_extractions from prior upload "
+                    f"(skipped fresh extraction in --quick mode)"
+                )
+        except Exception as _e:
+            print(
+                f"       Phase 52 preservation failed (continuing without): "
+                f"{type(_e).__name__}: {_e}"
+            )
+
+    # Phase 48 — capture the comment hashes for every entry in
+    # extractions_by_rnid (whether fresh from this run or preserved from
+    # Phase 52). Persisted to comment_extractions.comment_hash AFTER
+    # the bridge POST so the next cron's diff check works correctly.
+    if extractions_by_rnid:
+        from extract import hash_comment as _hash_comment_fn
+        _record_by_rnid = {r.get("resv_name_id"): r for r in records}
+        for _rnid in extractions_by_rnid:
+            _rec = _record_by_rnid.get(_rnid)
+            if _rec is not None:
+                extracted_comment_hashes[_rnid] = _hash_comment_fn(
+                    _rec.get("comments")
+                )
 
     # Step 3 — A-lister
     findings_by_rnid: dict[int, list[dict]] = {}
