@@ -358,12 +358,39 @@ def run_daily(
         print(f"[4b/5] zoho fetch failed (continuing without it): {e}")
         zoho_data = {}
 
+    # Phase 50 — fetch pool heating data from explore_pool_heating RPC
+    # so the dashboard's cached flash_report.payload.pool_heating list is
+    # populated with Phase 49 category-aware results, not always empty.
+    # The dashboard reads from this cached list (not the live RPC), so
+    # without this step the Pool Heating panel shows 0 rows for every
+    # day.
+    pool_heating_data: list[dict] = []
+    try:
+        from supa import client as _supa_client
+        _sb = _supa_client()
+        _end_date = report_date + timedelta(days=14)
+        _resp = _sb.rpc("explore_pool_heating", {
+            "p_start": report_date.isoformat(),
+            "p_end": _end_date.isoformat(),
+        }).execute()
+        pool_heating_data = _resp.data or []
+        print(
+            f"[4c/5] Pool heating: {len(pool_heating_data)} rooms over "
+            f"{report_date} → {_end_date}"
+        )
+    except Exception as _e:
+        print(
+            f"[4c/5] Pool heating fetch failed (continuing with empty list): "
+            f"{type(_e).__name__}: {_e}"
+        )
+
     # Step 5 — assemble + build envelope + POST
     flash_report_payload = assemble_payload_in_memory(
         records, extractions_by_rnid, findings_by_rnid,
         report_date, weather,
         birthdays_override=birthdays_override,
         zoho_data=zoho_data,
+        pool_heating=pool_heating_data,
     )
     envelope = build_envelope(
         report_date=report_date,
