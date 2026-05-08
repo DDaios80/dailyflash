@@ -50,10 +50,10 @@ as $$
         when upper(coalesce(ead.room_category_label, '')) like 'V%' then true
         -- Collection suites: heated by package, no dashboard action.
         when upper(coalesce(ead.room_category_label, '')) like 'C%' then false
-        -- DLXP and DJSTE (Deluxe Junior Suite w/ pool): pool exists but
-        -- never heatable. Both DJSTE and DJSTEP listed for safety; only
-        -- DJSTE has been observed in production data so far.
-        when upper(coalesce(ead.room_category_label, '')) in ('DLXP', 'DJSTE', 'DJSTEP') then false
+        -- DLXP and DJSTEP: private pool exists but never heatable.
+        -- (DJSTE without trailing P = no private pool, falls through
+        -- to ELSE — also excluded since there's no pool to heat.)
+        when upper(coalesce(ead.room_category_label, '')) in ('DLXP', 'DJSTEP') then false
         -- JSTEP and STEP: heated only if comment mentions it.
         when upper(coalesce(ead.room_category_label, '')) in ('JSTEP', 'STEP')
           then coalesce(ead.ce_pool_heating, false)
