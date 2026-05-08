@@ -248,14 +248,80 @@ def run_daily(
             birthdays_override = None
 
     # Step 2 — LLM COMMENTS extraction
+    # Phase 48 — also re-extract in-house guests whose comment hash changed
+    # since the last extraction. Catches mid-stay edits (upsells, late
+    # requests) that the original first-ingest-only extraction missed.
     extractions_by_rnid: dict[int, dict] = {}
+    extracted_comment_hashes: dict[int, str] = {}
     if run_extract:
-        from extract import extract_batch, _should_extract
-        end = report_date + timedelta(days=extract_window_days)
-        in_scope = [r for r in records if _should_extract(r, report_date, end)]
-        print(f"[2/5] Extracting from {len(in_scope)} in-scope reservations...")
+        from extract import (
+            extract_batch,
+            select_extraction_candidates,
+            hash_comment,
+        )
+
+        # Fetch existing comment hashes for in-house reservations from
+        # the previous upload's comment_extractions rows. Best-effort —
+        # if the DB query fails, we fall back to arrival-window-only
+        # selection (existing behaviour).
+        existing_hash_by_rnid: dict[int, str | None] = {}
+        try:
+            from supa import client as _supa_client
+            _sb = _supa_client()
+            in_house_rnids = [
+                r.get("resv_name_id") for r in records
+                if r.get("resv_name_id") is not None
+            ]
+            if in_house_rnids:
+                # Page through in chunks of 500 — Supabase PostgREST has
+                # a query length limit on .in_().
+                for i in range(0, len(in_house_rnids), 500):
+                    chunk = in_house_rnids[i : i + 500]
+                    rows = (
+                        _sb.table("comment_extractions")
+                        .select("resv_name_id, comment_hash")
+                        .in_("resv_name_id", chunk)
+                        .execute()
+                        .data
+                        or []
+                    )
+                    for row in rows:
+                        rnid = row.get("resv_name_id")
+                        if rnid is not None:
+                            existing_hash_by_rnid[rnid] = row.get("comment_hash")
+        except Exception as _e:
+            print(
+                f"       Phase 48 hash prefetch failed (continuing with "
+                f"arrival-window only): {type(_e).__name__}: {_e}"
+            )
+            existing_hash_by_rnid = {}
+
+        in_scope = select_extraction_candidates(
+            records, report_date, extract_window_days,
+            existing_hash_by_rnid=existing_hash_by_rnid,
+        )
+        n_arrivals = sum(
+            1 for r in in_scope
+            if isinstance(r.get("arrival"), datetime)
+            and report_date <= r["arrival"].date() <= report_date + timedelta(days=extract_window_days)
+        )
+        n_in_house = len(in_scope) - n_arrivals
+        print(
+            f"[2/5] Extracting from {len(in_scope)} in-scope reservations "
+            f"({n_arrivals} arrivals + {n_in_house} in-house with changed comments)..."
+        )
         extractions, errors, es = asyncio.run(extract_batch(in_scope))
         extractions_by_rnid = {rid: ext.model_dump() for rid, ext in extractions.items()}
+
+        # Phase 48 — capture the comment hashes used for this extraction.
+        # Persisted to comment_extractions.comment_hash AFTER the bridge
+        # POST so the next cron run can detect changes.
+        rnid_to_record = {r.get("resv_name_id"): r for r in in_scope}
+        for rnid in extractions_by_rnid:
+            rec = rnid_to_record.get(rnid)
+            if rec is not None:
+                extracted_comment_hashes[rnid] = hash_comment(rec.get("comments"))
+
         print(f"       {es['succeeded']}/{es['total']} ok, {es['failed']} failed")
     else:
         print(f"[2/5] --no-extract (skipped)")
@@ -319,6 +385,52 @@ def run_daily(
     print("Posting envelope to edge function...")
     resp = post_envelope(envelope)
     print("Response:", json.dumps(resp, indent=2)[:1500])
+
+    # Phase 48 — persist the comment hashes for the extractions that just
+    # landed. Done AFTER the bridge POST because the bridge is responsible
+    # for inserting the comment_extractions rows; we just stamp the hash
+    # column on each row by reservation_id. Best-effort — failure here
+    # doesn't roll back the pipeline; the worst case is the next cron
+    # re-extracts in-house guests (a no-op for unchanged comments, plus
+    # a small LLM cost).
+    if extracted_comment_hashes and resp and resp.get("ok"):
+        upload_id = resp.get("upload_id") or (resp.get("verification") or {}).get("upload_id")
+        if upload_id:
+            try:
+                from supa import client as _supa_client
+                _sb = _supa_client()
+                rows = (
+                    _sb.table("reservations")
+                    .select("id, resv_name_id")
+                    .eq("upload_id", upload_id)
+                    .in_("resv_name_id", list(extracted_comment_hashes.keys()))
+                    .execute()
+                    .data
+                    or []
+                )
+                rid_by_rnid = {row["resv_name_id"]: row["id"] for row in rows}
+                stamped = 0
+                for rnid, comment_hash in extracted_comment_hashes.items():
+                    rid = rid_by_rnid.get(rnid)
+                    if not rid:
+                        continue
+                    try:
+                        _sb.table("comment_extractions").update(
+                            {"comment_hash": comment_hash}
+                        ).eq("reservation_id", rid).execute()
+                        stamped += 1
+                    except Exception:
+                        pass
+                print(
+                    f"       Phase 48: stamped comment_hash on "
+                    f"{stamped}/{len(extracted_comment_hashes)} extraction rows"
+                )
+            except Exception as _e:
+                print(
+                    f"       Phase 48 hash persist failed (next run will re-extract "
+                    f"in-house guests): {type(_e).__name__}: {_e}"
+                )
+
     print(f"\n=== DONE — report_date={report_date} ===")
     return resp
 

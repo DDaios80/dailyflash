@@ -246,6 +246,75 @@ def _should_extract(r: dict[str, Any], start: date, end: date) -> bool:
     return True
 
 
+def hash_comment(text: str | None) -> str:
+    """Phase 48 — deterministic hash of a reservation comment. Used to
+    detect mid-stay comment edits and trigger a fresh extraction. We
+    normalise (strip + collapse whitespace + lowercase) before hashing
+    so cosmetic edits (extra spaces, casing) don't trigger needless
+    re-extractions."""
+    import hashlib
+    import re as _re
+    raw = (text or "").strip()
+    normalised = _re.sub(r"\s+", " ", raw).lower()
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+
+def select_extraction_candidates(
+    records: list[dict[str, Any]],
+    report_date: date,
+    window_days: int,
+    *,
+    existing_hash_by_rnid: dict[int, str | None] | None = None,
+) -> list[dict[str, Any]]:
+    """Phase 48 — return reservations that need extraction.
+
+    Two cases:
+
+    1. Arrival window. Existing logic — any reservation arriving in
+       [report_date, report_date + window_days] with non-empty comments.
+
+    2. In-house with changed comments. Any reservation currently in-house
+       (arrived <= report_date <= departure) whose comment hash differs
+       from the stored hash in `comment_extractions.comment_hash`.
+
+    Caller passes `existing_hash_by_rnid` keyed on `resv_name_id`. Pass
+    None or an empty dict to skip case 2 (e.g. when running locally
+    without DB access).
+    """
+    end = report_date + timedelta(days=window_days)
+
+    arrivals = [r for r in records if _should_extract(r, report_date, end)]
+
+    if not existing_hash_by_rnid:
+        return arrivals
+
+    arrival_rnids = {r.get("resv_name_id") for r in arrivals}
+    in_house_changed: list[dict[str, Any]] = []
+    for r in records:
+        rnid = r.get("resv_name_id")
+        if rnid is None or rnid in arrival_rnids:
+            continue
+        arrival = r.get("arrival")
+        if isinstance(arrival, datetime):
+            arrival = arrival.date()
+        departure = r.get("departure")
+        if isinstance(departure, datetime):
+            departure = departure.date()
+        if not isinstance(arrival, date) or not isinstance(departure, date):
+            continue
+        if not (arrival <= report_date <= departure):
+            continue
+        comments = (r.get("comments") or "").strip()
+        if not comments:
+            continue
+        current_hash = hash_comment(comments)
+        stored_hash = existing_hash_by_rnid.get(rnid)
+        if stored_hash != current_hash:
+            in_house_changed.append(r)
+
+    return arrivals + in_house_changed
+
+
 def _reservation_prompt(r: dict[str, Any]) -> str:
     name_parts = [r.get("guest_title_desc") or r.get("guest_title") or "",
                   r.get("guest_first_name") or "",
