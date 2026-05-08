@@ -1,17 +1,24 @@
 -- Phase 49 — apply room-category business rules to pool heating dashboard.
 --
 -- Operations rules from Dimitris (7 May 2026):
---   - All Collection Suites (C*) have heated pools INCLUDED — always heated.
---   - All Villas (V*) are heated — always heated.
+--   - Collection Suites (C*) — heated pool INCLUDED in the package, so
+--     maintenance has no daily action to take. EXCLUDE from dashboard.
+--   - All Villas (V*) — always heated, daily action required by
+--     maintenance. INCLUDE on dashboard every day occupied.
 --   - Deluxe Sea View Room with individual pool (DLXP) — pool exists but
---     NEVER heatable.
---   - Deluxe Junior Suite with individual pool (DJSTEP) — pool exists but
---     NEVER heatable.
+--     NEVER heatable. EXCLUDE.
+--   - Deluxe Junior Suite with individual pool (DJSTEP) — same: never
+--     heatable. EXCLUDE.
 --   - Premium Junior Suite with Private pool (JSTEP) — CAN be heated on
 --     request. Use LLM-extracted comment flag.
 --   - One Bedroom Suite with private pool (STEP) — CAN be heated on
 --     request. Use LLM-extracted comment flag.
 --   - All other room categories — no private pool, no heating concept.
+--
+-- Important framing: this RPC powers an action-oriented dashboard
+-- ("which pools need heating today?"), not a data-truth view of which
+-- pools are heated. Collection pools ARE heated; they just don't need
+-- to be on the daily maintenance list.
 --
 -- Why at SQL: separation of concerns. The LLM extraction in `extract.py`
 -- is purely text-based ("does the comment mention pool heating?"). The
@@ -34,11 +41,15 @@ as $$
     -- Phase 49 — room-category-aware effective pool heating.
     select
       ead.*,
+      -- "effective_pool_heating" here means "should appear on the
+      -- maintenance dashboard", not "is the pool heated". Collection
+      -- suites are heated by package default but require no daily
+      -- action, so they're excluded.
       case
-        -- Collection suites: heated, included in the package.
-        when upper(coalesce(ead.room_category_label, '')) like 'C%' then true
-        -- Villas: always heated.
+        -- Villas: always heated, daily action required.
         when upper(coalesce(ead.room_category_label, '')) like 'V%' then true
+        -- Collection suites: heated by package, no dashboard action.
+        when upper(coalesce(ead.room_category_label, '')) like 'C%' then false
         -- DLXP and DJSTEP: pool exists but never heatable.
         when upper(coalesce(ead.room_category_label, '')) in ('DLXP', 'DJSTEP') then false
         -- JSTEP and STEP: heated only if comment mentions it.
@@ -91,16 +102,16 @@ as $$
 $$;
 grant execute on function explore_pool_heating(date, date) to authenticated;
 
--- Verify: count rooms in the panel by category bucket. Should show
--- non-zero counts for Collection and Villa (always heated) on any day
--- with such occupancy.
+-- Verify: count rooms in the panel by category bucket. Expected:
+-- Villas appear (action required), JSTEP/STEP appear when commented,
+-- Collection / DLXP / DJSTEP / Other do NOT appear.
 select
   case
-    when upper(coalesce(room_category_label, '')) like 'C%' then 'Collection (always heated)'
-    when upper(coalesce(room_category_label, '')) like 'V%' then 'Villa (always heated)'
-    when upper(coalesce(room_category_label, '')) in ('JSTEP', 'STEP') then 'JSTEP/STEP (heated if commented)'
-    when upper(coalesce(room_category_label, '')) in ('DLXP', 'DJSTEP') then 'DLXP/DJSTEP (never heated)'
-    else 'Other'
+    when upper(coalesce(room_category_label, '')) like 'V%' then 'Villa (action required)'
+    when upper(coalesce(room_category_label, '')) like 'C%' then 'Collection (SHOULD NOT APPEAR)'
+    when upper(coalesce(room_category_label, '')) in ('JSTEP', 'STEP') then 'JSTEP/STEP (commented)'
+    when upper(coalesce(room_category_label, '')) in ('DLXP', 'DJSTEP') then 'DLXP/DJSTEP (SHOULD NOT APPEAR)'
+    else 'Other (SHOULD NOT APPEAR)'
   end as bucket,
   count(*)
 from jsonb_to_recordset(explore_pool_heating(current_date, current_date + interval '14 days'))
