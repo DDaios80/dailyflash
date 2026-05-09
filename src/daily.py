@@ -117,6 +117,8 @@ def assemble_payload_in_memory(
     promoted_rooms: set | None = None,
     daily_briefing: dict | None = None,
     pool_heating: list[dict] | None = None,
+    pool_heating_grid: list[dict] | None = None,
+    pool_heating_calendar: dict | None = None,
     birthdays_override: list[dict] | None = None,
     zoho_data: dict[str, list[dict]] | None = None,
 ) -> dict:
@@ -196,6 +198,15 @@ def assemble_payload_in_memory(
         "alister_findings": al_panel_rows,
         "alister_findings_count": len(al_panel_rows),
         "pool_heating": pool_heating or [],
+        # Phase 60 — new structures for the redesigned pool-heating UI.
+        # `pool_heating_grid` = master list of all 47 heatable rooms with
+        # per-room "is heated today" state (red button when true).
+        # `pool_heating_calendar` = heated stays in the 14-day window for the
+        # Gantt-style calendar above the grid.
+        # The legacy `pool_heating` field stays for one cycle so the existing
+        # dashboard rendering doesn't break during the Lovable migration.
+        "pool_heating_grid": pool_heating_grid or [],
+        "pool_heating_calendar": pool_heating_calendar or {"window": {}, "stays": []},
         "daily_briefing": daily_briefing,
         "promoted_rooms": sorted(promoted_rooms),
         "totals": {
@@ -454,31 +465,40 @@ def run_daily(
     # Phase 50.2 — compute pool heating data from in-memory records.
     # Both the RPC and view-query paths failed due to PostgREST schema
     # cache issues on Lovable. Records are the parsed xlsx data we
-    # already have in memory, so we apply Phase 49 rules directly
+    # already have in memory, so we apply heating rules directly
     # without touching the DB. No PostgREST cache dependency.
+    #
+    # Phase 60 — new ``effective_pool_heating_v60`` rule: heating service
+    # follows what was BOOKED, not the actual assigned room. Upgrades from
+    # non-heatable categories don't get heating service. Plus we now emit
+    # two new structures (``pool_heating_grid`` for the 47-button master
+    # grid, ``pool_heating_calendar`` for the Gantt) alongside the legacy
+    # ``pool_heating`` list — the legacy list is kept for one cycle while
+    # the dashboard migrates to the new structures.
     #
     # pool_fence comes from current-run extractions_by_rnid (populated
     # when run_extract=True). On --quick runs, fence will be empty
     # until the next full cron repopulates comment_extractions.
     pool_heating_data: list[dict] = []
+    pool_heating_grid: list[dict] = []
+    pool_heating_calendar: dict = {"window": {}, "stays": []}
     try:
         from collections import defaultdict
-        _end_date = report_date + timedelta(days=14)
+        from heatable_rooms import (
+            HEATABLE_ROOMS,
+            HEATABLE_ROOM_NUMBERS,
+            effective_pool_heating_v60,
+        )
 
-        def _effective_pool_heating(category: str | None, ce_flag) -> bool:
-            """Phase 49 — category-based heating rules."""
-            cat = (category or "").upper()
-            if cat.startswith("V"):
-                return True   # Villas always heated, action required
-            if cat.startswith("C"):
-                return False  # Collection: heated by package, no action
-            if cat in ("DLXP", "DJSTEP"):
-                return False  # Pool exists but never heatable
-            if cat in ("JSTEP", "STEP"):
-                return bool(ce_flag)  # On request via comment
-            return False  # No private pool
+        # Phase 60 calendar window: yesterday + today (report_date) + 12 days forward.
+        _window_start = report_date - timedelta(days=1)
+        _window_end = report_date + timedelta(days=12)
+        # Legacy compat: previous code used a +14d window for the legacy
+        # ``pool_heating`` list. Keep the same window for the legacy list.
+        _legacy_end = report_date + timedelta(days=14)
 
-        _eligible: list[dict] = []
+        _eligible: list[dict] = []  # legacy list rows (effective heated OR pool_fence)
+        _heated_stays: list[dict] = []  # Phase 60 — heated only, for grid + calendar
         _raw_count = 0
         for _r in records:
             _arrival = _r.get("arrival")
@@ -489,7 +509,7 @@ def run_daily(
                 _departure = _departure.date()
             if not isinstance(_arrival, date) or not isinstance(_departure, date):
                 continue
-            if not (_arrival <= _end_date and _departure >= report_date):
+            if not (_arrival <= _legacy_end and _departure >= _window_start):
                 continue
             _raw_count += 1
 
@@ -498,21 +518,51 @@ def run_daily(
             _ce_heating = bool(_ext.get("pool_heating", False))
             _pool_fence = bool(_ext.get("pool_fence", False))
 
-            _eff = _effective_pool_heating(_r.get("room_category_label"), _ce_heating)
-            if _eff or _pool_fence:
-                _eligible.append({
-                    "room": _r.get("room"),
-                    "guest_first_name": _r.get("guest_first_name"),
+            _booked_cat = _r.get("booked_room_category_label")
+            _actual_cat = _r.get("room_category_label")
+            _eff = effective_pool_heating_v60(_booked_cat, _actual_cat, _ce_heating)
+
+            # Phase 60 — collect heated stays in the 14-day window for grid+calendar.
+            # Only heatable rooms by number (the registry; villas, JSTEP, STEP).
+            _room = _r.get("room")
+            if (
+                _eff
+                and _room in HEATABLE_ROOM_NUMBERS
+                and _arrival <= _window_end
+                and _departure >= _window_start
+            ):
+                _full_name = (
+                    (_r.get("guest_first_name") or "").strip()
+                    + " "
+                    + (_r.get("guest_name") or "").strip()
+                ).strip() or (_r.get("guest_name") or "")
+                _heated_stays.append({
+                    "room": _room,
                     "guest_name": _r.get("guest_name"),
-                    "room_category_label": _r.get("room_category_label"),
-                    "arrival_date": _arrival,
-                    "departure_date": _departure,
+                    "guest_full_name": _full_name,
+                    "arrival": _arrival.isoformat(),
+                    "departure": _departure.isoformat(),
                     "nights": (_departure - _arrival).days,
-                    "_effective_pool_heating": _eff,
-                    "pool_fence": _pool_fence,
+                    "booked_room_category_label": _booked_cat,
+                    "room_category_label": _actual_cat,
                 })
 
-        # Group by room — Phase 31.1 dedup pattern.
+            # Legacy ``pool_heating`` list: same shape as before for backward compat.
+            if _eff or _pool_fence:
+                if _arrival <= _legacy_end and _departure >= report_date:
+                    _eligible.append({
+                        "room": _room,
+                        "guest_first_name": _r.get("guest_first_name"),
+                        "guest_name": _r.get("guest_name"),
+                        "room_category_label": _actual_cat,
+                        "arrival_date": _arrival,
+                        "departure_date": _departure,
+                        "nights": (_departure - _arrival).days,
+                        "_effective_pool_heating": _eff,
+                        "pool_fence": _pool_fence,
+                    })
+
+        # Group legacy list by room (Phase 31.1 dedup pattern).
         _by_room: dict[str, list[dict]] = defaultdict(list)
         for _r in _eligible:
             _room = _r.get("room")
@@ -552,14 +602,46 @@ def run_daily(
         pool_heating_data.sort(
             key=lambda x: ((x.get("arrival") or ""), (x.get("room") or ""))
         )
+
+        # Phase 60 — build the master 47-room grid.
+        # is_heated_today = any heated stay where today (report_date) is in [arrival, departure).
+        _today_iso = report_date.isoformat()
+        _heated_rooms_today: set[str] = set()
+        for _s in _heated_stays:
+            if _s["arrival"] <= _today_iso < _s["departure"]:
+                _heated_rooms_today.add(_s["room"])
+
+        for _hr in HEATABLE_ROOMS:
+            pool_heating_grid.append({
+                "room": _hr["room"],
+                "type_code": _hr["type_code"],
+                "description": _hr["description"],
+                "is_heated_today": _hr["room"] in _heated_rooms_today,
+            })
+
+        # Phase 60 — calendar payload (Gantt source data).
+        # Stays sorted by arrival date then room for deterministic rendering.
+        _heated_stays.sort(key=lambda s: (s["arrival"], s["room"]))
+        pool_heating_calendar = {
+            "window": {
+                "start": _window_start.isoformat(),
+                "end": _window_end.isoformat(),
+                "anchor": report_date.isoformat(),
+                "days": (_window_end - _window_start).days + 1,
+            },
+            "stays": _heated_stays,
+        }
+
         print(
-            f"[4c/5] Pool heating: {len(pool_heating_data)} rooms over "
-            f"{report_date} → {_end_date} "
-            f"({_raw_count} active in window, {len(_eligible)} eligible)"
+            f"[4c/5] Pool heating: legacy={len(pool_heating_data)} rooms, "
+            f"grid={len(pool_heating_grid)} buttons "
+            f"({sum(1 for g in pool_heating_grid if g['is_heated_today'])} red today), "
+            f"calendar={len(_heated_stays)} stays over "
+            f"{_window_start} → {_window_end} ({_raw_count} active in window)"
         )
     except Exception as _e:
         print(
-            f"[4c/5] Pool heating compute failed (continuing with empty list): "
+            f"[4c/5] Pool heating compute failed (continuing with empty data): "
             f"{type(_e).__name__}: {_e}"
         )
 
@@ -570,6 +652,8 @@ def run_daily(
         birthdays_override=birthdays_override,
         zoho_data=zoho_data,
         pool_heating=pool_heating_data,
+        pool_heating_grid=pool_heating_grid,
+        pool_heating_calendar=pool_heating_calendar,
     )
     envelope = build_envelope(
         report_date=report_date,
