@@ -119,6 +119,7 @@ def assemble_payload_in_memory(
     pool_heating: list[dict] | None = None,
     pool_heating_grid: list[dict] | None = None,
     pool_heating_calendar: dict | None = None,
+    pool_fence_other_rooms: list[dict] | None = None,
     birthdays_override: list[dict] | None = None,
     zoho_data: dict[str, list[dict]] | None = None,
 ) -> dict:
@@ -207,6 +208,8 @@ def assemble_payload_in_memory(
         # dashboard rendering doesn't break during the Lovable migration.
         "pool_heating_grid": pool_heating_grid or [],
         "pool_heating_calendar": pool_heating_calendar or {"window": {}, "stays": []},
+        # Phase 60.1 — fence requests in non-grid rooms (DLXP, DJSTEP, Collection).
+        "pool_fence_other_rooms": pool_fence_other_rooms or [],
         "daily_briefing": daily_briefing,
         "promoted_rooms": sorted(promoted_rooms),
         "totals": {
@@ -482,6 +485,7 @@ def run_daily(
     pool_heating_data: list[dict] = []
     pool_heating_grid: list[dict] = []
     pool_heating_calendar: dict = {"window": {}, "stays": []}
+    pool_fence_other_rooms: list[dict] = []  # Phase 60.1 — fence in non-grid rooms
     try:
         from collections import defaultdict
         from heatable_rooms import (
@@ -498,7 +502,8 @@ def run_daily(
         _legacy_end = report_date + timedelta(days=14)
 
         _eligible: list[dict] = []  # legacy list rows (effective heated OR pool_fence)
-        _heated_stays: list[dict] = []  # Phase 60 — heated only, for grid + calendar
+        _window_stays: list[dict] = []  # Phase 60.1 — stays with heating OR fence in heatable rooms
+        _other_fence_stays: list[dict] = []  # Phase 60.1 — fence in non-grid rooms
         _raw_count = 0
         for _r in records:
             _arrival = _r.get("arrival")
@@ -522,21 +527,21 @@ def run_daily(
             _actual_cat = _r.get("room_category_label")
             _eff = effective_pool_heating_v60(_booked_cat, _actual_cat, _ce_heating)
 
-            # Phase 60 — collect heated stays in the 14-day window for grid+calendar.
-            # Only heatable rooms by number (the registry; villas, JSTEP, STEP).
             _room = _r.get("room")
+            _full_name = (
+                (_r.get("guest_first_name") or "").strip()
+                + " "
+                + (_r.get("guest_name") or "").strip()
+            ).strip() or (_r.get("guest_name") or "")
+
+            # Phase 60.1 — collect stays with heating OR fence in the 14-day
+            # window. Bucket by whether the room is on the heatable grid.
             if (
-                _eff
-                and _room in HEATABLE_ROOM_NUMBERS
+                (_eff or _pool_fence)
                 and _arrival <= _window_end
                 and _departure >= _window_start
             ):
-                _full_name = (
-                    (_r.get("guest_first_name") or "").strip()
-                    + " "
-                    + (_r.get("guest_name") or "").strip()
-                ).strip() or (_r.get("guest_name") or "")
-                _heated_stays.append({
+                _stay = {
                     "room": _room,
                     "guest_name": _r.get("guest_name"),
                     "guest_full_name": _full_name,
@@ -545,7 +550,16 @@ def run_daily(
                     "nights": (_departure - _arrival).days,
                     "booked_room_category_label": _booked_cat,
                     "room_category_label": _actual_cat,
-                })
+                    "heated": bool(_eff),
+                    "fence": bool(_pool_fence),
+                }
+                if _room in HEATABLE_ROOM_NUMBERS:
+                    _window_stays.append(_stay)
+                elif _pool_fence:
+                    # Non-grid room with a fence request: surface separately.
+                    # (Heating in non-grid rooms is impossible by rule, so we
+                    # only need the fence path here.)
+                    _other_fence_stays.append(_stay)
 
             # Legacy ``pool_heating`` list: same shape as before for backward compat.
             if _eff or _pool_fence:
@@ -603,13 +617,18 @@ def run_daily(
             key=lambda x: ((x.get("arrival") or ""), (x.get("room") or ""))
         )
 
-        # Phase 60 — build the master 47-room grid.
-        # is_heated_today = any heated stay where today (report_date) is in [arrival, departure).
+        # Phase 60 — build the master 47-room grid with two indicators per
+        # button: is_heated_today (red bg) and is_fence_today (icon overlay).
+        # "today" = report_date is in [arrival, departure).
         _today_iso = report_date.isoformat()
         _heated_rooms_today: set[str] = set()
-        for _s in _heated_stays:
+        _fence_rooms_today: set[str] = set()
+        for _s in _window_stays:
             if _s["arrival"] <= _today_iso < _s["departure"]:
-                _heated_rooms_today.add(_s["room"])
+                if _s["heated"]:
+                    _heated_rooms_today.add(_s["room"])
+                if _s["fence"]:
+                    _fence_rooms_today.add(_s["room"])
 
         for _hr in HEATABLE_ROOMS:
             pool_heating_grid.append({
@@ -617,11 +636,13 @@ def run_daily(
                 "type_code": _hr["type_code"],
                 "description": _hr["description"],
                 "is_heated_today": _hr["room"] in _heated_rooms_today,
+                "is_fence_today": _hr["room"] in _fence_rooms_today,
             })
 
         # Phase 60 — calendar payload (Gantt source data).
-        # Stays sorted by arrival date then room for deterministic rendering.
-        _heated_stays.sort(key=lambda s: (s["arrival"], s["room"]))
+        # Stays carry both ``heated`` and ``fence`` booleans (at least one is
+        # true). Sorted by arrival date then room for deterministic rendering.
+        _window_stays.sort(key=lambda s: (s["arrival"], s["room"]))
         pool_heating_calendar = {
             "window": {
                 "start": _window_start.isoformat(),
@@ -629,14 +650,25 @@ def run_daily(
                 "anchor": report_date.isoformat(),
                 "days": (_window_end - _window_start).days + 1,
             },
-            "stays": _heated_stays,
+            "stays": _window_stays,
         }
+
+        # Phase 60.1 — fence requests in non-grid rooms (DLXP, DJSTEP,
+        # Collection categories). Surfaced separately so the housekeeping
+        # team doesn't lose visibility on fence work that won't appear in
+        # the heatable-rooms grid.
+        _other_fence_stays.sort(key=lambda s: (s["arrival"], s["room"]))
+        pool_fence_other_rooms = [
+            {**_s, "in_house_today": _s["arrival"] <= _today_iso < _s["departure"]}
+            for _s in _other_fence_stays
+        ]
 
         print(
             f"[4c/5] Pool heating: legacy={len(pool_heating_data)} rooms, "
             f"grid={len(pool_heating_grid)} buttons "
-            f"({sum(1 for g in pool_heating_grid if g['is_heated_today'])} red today), "
-            f"calendar={len(_heated_stays)} stays over "
+            f"({len(_heated_rooms_today)} red, {len(_fence_rooms_today)} fence today), "
+            f"calendar={len(_window_stays)} stays, "
+            f"other-fence={len(pool_fence_other_rooms)} non-grid stays over "
             f"{_window_start} → {_window_end} ({_raw_count} active in window)"
         )
     except Exception as _e:
@@ -654,6 +686,7 @@ def run_daily(
         pool_heating=pool_heating_data,
         pool_heating_grid=pool_heating_grid,
         pool_heating_calendar=pool_heating_calendar,
+        pool_fence_other_rooms=pool_fence_other_rooms,
     )
     envelope = build_envelope(
         report_date=report_date,
