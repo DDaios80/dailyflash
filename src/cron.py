@@ -304,7 +304,86 @@ def main() -> int:
         print(f"[cron] site-inspection sync failed (non-fatal): {type(e).__name__}: {e}",
               file=sys.stderr)
 
+    # Phase 60.3 — extraction-freshness sanity check.
+    # ingest-flash-report has historically silently dropped comment_extractions
+    # writes (April 21 → May 9 incident: 18 days of frozen extractions despite
+    # nightly cron success). After every cron run, query the DB and warn loudly
+    # if max(extracted_at) is older than today. Non-fatal but visible — the
+    # warning lands in Railway logs and surfaces the regression early.
+    if not args.quick:
+        try:
+            _check_extraction_freshness()
+        except Exception as e:
+            print(f"[cron] freshness check failed (non-fatal): {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
     return 0
+
+
+def _check_extraction_freshness() -> None:
+    """Query comment_extractions.max(extracted_at) and warn if stale.
+
+    Runs after the bridge POST has completed. If the upsert in
+    ingest-flash-report silently drops writes, this catches it on the
+    very next cron — instead of waiting 18 days and a hand-audit.
+    """
+    from datetime import datetime, timezone, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        today_athens = datetime.now(ZoneInfo("Europe/Athens")).date()
+    except Exception:
+        today_athens = (datetime.now(timezone.utc) + timedelta(hours=3)).date()
+
+    from supa import client
+    sb = client()
+    res = (
+        sb.from_("comment_extractions")
+        .select("extracted_at")
+        .order("extracted_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        print(
+            "[freshness-check] *** WARNING: comment_extractions table is "
+            "EMPTY. ingest-flash-report may be silently dropping writes. ***",
+            file=sys.stderr,
+        )
+        return
+
+    last = (rows[0].get("extracted_at") or "")[:10]
+    days_stale = (today_athens - _parse_iso_date(last)).days if last else None
+
+    if not last:
+        print(
+            "[freshness-check] *** WARNING: comment_extractions row has no "
+            "extracted_at. Schema or write bug. ***",
+            file=sys.stderr,
+        )
+    elif days_stale is not None and days_stale > 1:
+        print(
+            f"[freshness-check] *** WARNING: comment_extractions max(extracted_at) "
+            f"= {last} (today is {today_athens}, stale by {days_stale} days). "
+            f"ingest-flash-report is dropping writes. Investigate the edge "
+            f"function upsert (must be ON CONFLICT DO UPDATE, not DO NOTHING). ***",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[freshness-check] OK — comment_extractions fresh as of {last} "
+            f"(today is {today_athens})."
+        )
+
+
+def _parse_iso_date(s: str):
+    """Parse 'YYYY-MM-DD' to a date; return today on failure."""
+    from datetime import date as _d
+    try:
+        y, m, d = s.split("-")
+        return _d(int(y), int(m), int(d))
+    except Exception:
+        return _d.today()
 
 
 if __name__ == "__main__":
