@@ -53,10 +53,35 @@ class CommentExtraction(BaseModel):
         description="Verbatim or close paraphrase of the allergy sentence. Null if no allergy.",
     )
     pool_fence: bool = Field(
-        description="True if the comment mentions a pool fence (e.g. 'POOL FENCE', 'pool fence free')."
+        description=(
+            "True if a pool safety fence is requested or arranged for this stay. "
+            "Set True for any of: 'POOL FENCE', 'pool fence', 'pool fence free', "
+            "'FOC pool fence', 'fence around the pool', 'kid-proof the pool', "
+            "'pool gate', 'pool safety', or the Greek equivalents "
+            "('κάγκελο πισίνας', 'φράχτης πισίνας', 'περίφραξη πισίνας'). "
+            "Set False if the request was denied / declined / not approved. "
+            "DO NOT infer fence from kids alone ('1 kid = 4 y.o.', "
+            "'child age 3', 'baby', 'toddler') — only an explicit fence "
+            "request or arrangement counts. False if the comment doesn't "
+            "mention a fence at all."
+        )
     )
     pool_heating: bool = Field(
-        description="True if pool heating is mentioned (e.g. 'HP', 'heated pool', 'pool heating')."
+        description=(
+            "True if pool heating is requested or arranged for this stay. "
+            "Set True for any of: 'HP', 'heated pool', 'pool heating', "
+            "'please heat the pool', 'make sure the pool is heated', or "
+            "the Greek equivalents ('ζεστή πισίνα', 'θέρμανση πισίνας', "
+            "'να ζεσταθεί η πισίνα', 'θερμαινόμενη πισίνα'). "
+            "Set False if the request was denied / declined / not approved "
+            "(e.g. 'requested pool heating - denied', 'pool heating not "
+            "approved'). The denial overrides the request — read the whole "
+            "phrase, not just the keyword. "
+            "DO NOT infer heating from villa booking, private-pool category, "
+            "or season — only an explicit heating request or arrangement "
+            "in the comment counts. False if the comment doesn't mention "
+            "pool heating at all."
+        )
     )
     free_transfer: bool = Field(
         description="True if arrival/departure transfer is complimentary (e.g. 'free transfers')."
