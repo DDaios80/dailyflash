@@ -120,6 +120,7 @@ def assemble_payload_in_memory(
     pool_heating_grid: list[dict] | None = None,
     pool_heating_calendar: dict | None = None,
     pool_fence_other_rooms: list[dict] | None = None,
+    pool_cleaning: dict | None = None,
     birthdays_override: list[dict] | None = None,
     zoho_data: dict[str, list[dict]] | None = None,
 ) -> dict:
@@ -210,6 +211,8 @@ def assemble_payload_in_memory(
         "pool_heating_calendar": pool_heating_calendar or {"window": {}, "stays": []},
         # Phase 60.1 — fence requests in non-grid rooms (DLXP, DJSTEP, Collection).
         "pool_fence_other_rooms": pool_fence_other_rooms or [],
+        # Phase 61 — pool cleaning forecast for the maintenance coordinator.
+        "pool_cleaning": pool_cleaning or {"window": {}, "today": {}, "forecast": [], "all_days": []},
         "daily_briefing": daily_briefing,
         "promoted_rooms": sorted(promoted_rooms),
         "totals": {
@@ -762,6 +765,85 @@ def run_daily(
             f"{type(_e).__name__}: {_e}"
         )
 
+    # Phase 61 — pool cleaning forecast for the maintenance coordinator.
+    # Counts occupied private-pool rooms per day (137-room inventory).
+    # Distinct from heating: heating only applies to 47 rooms; cleaning to
+    # all 137. DLXP and DJSTEP are aliased to DLXP (same physical inventory,
+    # different rate plan: HB vs Residents' Club). C2BSP combined-suite
+    # bookings count as 1 cleaning per booking (we count distinct occupied
+    # room numbers; Opera typically books C2BSP under one of the two
+    # component room numbers).
+    pool_cleaning: dict = {"window": {}, "today": {}, "forecast": [], "all_days": []}
+    try:
+        from collections import defaultdict
+        from pool_rooms import POOL_ROOM_NUMBERS, display_category_for_cleaning
+
+        _cleaning_days = 7
+        _cleaning_window_end = report_date + timedelta(days=_cleaning_days - 1)
+
+        # Pre-coerce dates on records (some are datetimes, some dates).
+        _record_dates = []
+        for _r in records:
+            _arr = _r.get("arrival")
+            _dep = _r.get("departure")
+            if isinstance(_arr, datetime):
+                _arr = _arr.date()
+            if isinstance(_dep, datetime):
+                _dep = _dep.date()
+            if not isinstance(_arr, date) or not isinstance(_dep, date):
+                continue
+            _room = _r.get("room")
+            if not _room or _room not in POOL_ROOM_NUMBERS:
+                continue
+            # For the breakdown: prefer the BOOKED category if it bears a pool
+            # (preserves DLXP vs DJSTEP rate-plan distinction the coordinator
+            # cares about). Else fall back to actual (collapses DLX→DLXP and
+            # similar upgrades into the operationally relevant pool category).
+            _display_cat = display_category_for_cleaning(
+                _r.get("booked_room_category_label"),
+                _r.get("room_category_label"),
+                _room,
+            ) or "UNKNOWN"
+            _record_dates.append((_arr, _dep, _room, _display_cat))
+
+        _all_days: list[dict] = []
+        for _offset in range(_cleaning_days):
+            _d = report_date + timedelta(days=_offset)
+            _occupied_rooms: set[str] = set()
+            _by_category: dict[str, int] = defaultdict(int)
+            for _arr, _dep, _room, _cat in _record_dates:
+                if not (_arr <= _d < _dep):
+                    continue
+                if _room in _occupied_rooms:
+                    continue  # dedupe (multiple reservations same day same room)
+                _occupied_rooms.add(_room)
+                _by_category[_cat] += 1
+            _all_days.append({
+                "date": _d.isoformat(),
+                "count": len(_occupied_rooms),
+                "by_category": dict(sorted(_by_category.items())),
+            })
+
+        pool_cleaning = {
+            "window": {
+                "start": report_date.isoformat(),
+                "end": _cleaning_window_end.isoformat(),
+                "days": _cleaning_days,
+            },
+            "today": _all_days[0],
+            "forecast": _all_days[1:],
+            "all_days": _all_days,
+        }
+        print(
+            f"[4d/5] Pool cleaning: today={pool_cleaning['today']['count']} pools to clean, "
+            f"7-day total={sum(d['count'] for d in _all_days)} cleanings"
+        )
+    except Exception as _e:
+        print(
+            f"[4d/5] Pool cleaning compute failed (continuing with empty data): "
+            f"{type(_e).__name__}: {_e}"
+        )
+
     # Step 5 — assemble + build envelope + POST
     flash_report_payload = assemble_payload_in_memory(
         records, extractions_by_rnid, findings_by_rnid,
@@ -772,6 +854,7 @@ def run_daily(
         pool_heating_grid=pool_heating_grid,
         pool_heating_calendar=pool_heating_calendar,
         pool_fence_other_rooms=pool_fence_other_rooms,
+        pool_cleaning=pool_cleaning,
     )
     envelope = build_envelope(
         report_date=report_date,
