@@ -274,38 +274,47 @@ def run_daily(
             hash_comment,
         )
 
-        # Fetch existing comment hashes for in-house reservations from
-        # the previous upload's comment_extractions rows. Best-effort —
-        # if the DB query fails, we fall back to arrival-window-only
-        # selection (existing behaviour).
+        # Phase 60.5 — force re-extraction of every in-house guest every
+        # cron. Phase 48's hash-based "only re-extract changed comments"
+        # optimization is currently unavailable: the
+        # ``comment_extractions.comment_hash`` column doesn't exist on
+        # the deployed schema, and the prior prefetch query also
+        # referenced ``comment_extractions.resv_name_id`` which doesn't
+        # exist either. Both raised 42703 every cron, silently falling
+        # back to arrival-window only — so in-house guests whose comments
+        # changed mid-stay (upsells, FOC Pool Fence package additions,
+        # late-checkout requests) were NEVER picked up.
+        #
+        # Until comment_hash is added, populate existing_hash_by_rnid
+        # with None for every in-house reservation. ``None != current_hash``
+        # is always true in select_extraction_candidates, so every
+        # in-house guest with a non-empty comment gets re-extracted.
+        # Cost: ~5-10 extra USD/cron in Claude calls. Benefit: in-house
+        # comment edits actually reach the dashboard.
         existing_hash_by_rnid: dict[int, str | None] = {}
         try:
-            from supa import client as _supa_client
-            _sb = _supa_client()
-            in_house_rnids = [
-                r.get("resv_name_id") for r in records
-                if r.get("resv_name_id") is not None
-            ]
-            if in_house_rnids:
-                # Page through in chunks of 500 — Supabase PostgREST has
-                # a query length limit on .in_().
-                for i in range(0, len(in_house_rnids), 500):
-                    chunk = in_house_rnids[i : i + 500]
-                    rows = (
-                        _sb.table("comment_extractions")
-                        .select("resv_name_id, comment_hash")
-                        .in_("resv_name_id", chunk)
-                        .execute()
-                        .data
-                        or []
-                    )
-                    for row in rows:
-                        rnid = row.get("resv_name_id")
-                        if rnid is not None:
-                            existing_hash_by_rnid[rnid] = row.get("comment_hash")
+            for _r in records:
+                _arr = _r.get("arrival")
+                _dep = _r.get("departure")
+                if isinstance(_arr, datetime):
+                    _arr = _arr.date()
+                if isinstance(_dep, datetime):
+                    _dep = _dep.date()
+                if not isinstance(_arr, date) or not isinstance(_dep, date):
+                    continue
+                if not (_arr <= report_date <= _dep):
+                    continue
+                _rnid = _r.get("resv_name_id")
+                if _rnid is not None:
+                    existing_hash_by_rnid[_rnid] = None  # forces re-extraction
+            print(
+                f"       Phase 60.5: forcing re-extraction of "
+                f"{len(existing_hash_by_rnid)} in-house guests "
+                f"(comment_hash optimization unavailable)"
+            )
         except Exception as _e:
             print(
-                f"       Phase 48 hash prefetch failed (continuing with "
+                f"       Phase 60.5 in-house map failed (continuing with "
                 f"arrival-window only): {type(_e).__name__}: {_e}"
             )
             existing_hash_by_rnid = {}
