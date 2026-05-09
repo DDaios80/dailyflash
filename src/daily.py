@@ -503,6 +503,49 @@ def run_daily(
             effective_pool_heating_v60,
         )
 
+        # Phase 60.7 — fetch manual overrides from pool_heating_overrides
+        # (created by Lovable in the override-UI work). Each row carries:
+        #   reservation_id (uuid → reservations.id)
+        #   override_type: 'heating' or 'fence'
+        #   forced_value: bool
+        # We embed reservations.resv_name_id so we can match against the
+        # records dict (which has resv_name_id from the xlsx, not the
+        # Supabase UUID). Currently PostgREST schema cache may not see this
+        # table (PGRST205) — that's the same persistent issue as zoho_notes.
+        # Falls back to no-op if fetch fails: the grid still renders, just
+        # without override merge. Once PostgREST restarts, overrides flow.
+        overrides_by_rnid: dict[int, dict[str, bool]] = {}
+        try:
+            from supa import client as _supa_override_client
+            _osb = _supa_override_client()
+            _override_rows = (
+                _osb.table("pool_heating_overrides")
+                .select(
+                    "override_type, forced_value, reservations!inner(resv_name_id)"
+                )
+                .execute()
+                .data
+                or []
+            )
+            for _ov in _override_rows:
+                _rnid = (_ov.get("reservations") or {}).get("resv_name_id")
+                _otype = _ov.get("override_type")
+                _val = _ov.get("forced_value")
+                if _rnid is None or _otype not in ("heating", "fence") or _val is None:
+                    continue
+                overrides_by_rnid.setdefault(_rnid, {})[_otype] = bool(_val)
+            print(
+                f"       Phase 60.7: loaded {len(overrides_by_rnid)} reservation overrides "
+                f"from pool_heating_overrides"
+            )
+        except Exception as _ov_e:
+            print(
+                f"       Phase 60.7 override fetch failed (continuing without "
+                f"overrides — grid uses LLM-derived state only): "
+                f"{type(_ov_e).__name__}: {_ov_e}"
+            )
+            overrides_by_rnid = {}
+
         # Phase 60 calendar window: yesterday + today (report_date) + 12 days forward.
         _window_start = report_date - timedelta(days=1)
         _window_end = report_date + timedelta(days=12)
@@ -543,10 +586,21 @@ def run_daily(
                 + (_r.get("guest_name") or "").strip()
             ).strip() or (_r.get("guest_name") or "")
 
-            # Phase 60.1 — collect stays with heating OR fence in the 14-day
-            # window. Bucket by whether the room is on the heatable grid.
+            # Phase 60.7 — apply per-reservation manual overrides on top of
+            # the LLM-derived state. Override is the source of truth when
+            # set; ``auto_*`` keeps the LLM-derived value for the UI to
+            # show "this is overridden" markers.
+            _ov = overrides_by_rnid.get(_rnid, {}) if _rnid is not None else {}
+            _ov_heating = _ov.get("heating")  # None | bool
+            _ov_fence = _ov.get("fence")
+            _effective_heated = _ov_heating if _ov_heating is not None else bool(_eff)
+            _effective_fence = _ov_fence if _ov_fence is not None else bool(_pool_fence)
+
+            # Phase 60.1 — collect stays with heating OR fence (effective,
+            # post-override) in the 14-day window. Bucket by whether the
+            # room is on the heatable grid.
             if (
-                (_eff or _pool_fence)
+                (_effective_heated or _effective_fence)
                 and _arrival <= _window_end
                 and _departure >= _window_start
             ):
@@ -559,12 +613,17 @@ def run_daily(
                     "nights": (_departure - _arrival).days,
                     "booked_room_category_label": _booked_cat,
                     "room_category_label": _actual_cat,
-                    "heated": bool(_eff),
-                    "fence": bool(_pool_fence),
+                    "heated": _effective_heated,
+                    "fence": _effective_fence,
+                    # Phase 60.7 override transparency:
+                    "auto_heated": bool(_eff),
+                    "auto_fence": bool(_pool_fence),
+                    "override_heating": _ov_heating,  # None | bool
+                    "override_fence": _ov_fence,
                 }
                 if _room in HEATABLE_ROOM_NUMBERS:
                     _window_stays.append(_stay)
-                elif _pool_fence:
+                elif _effective_fence:
                     # Non-grid room with a fence request: surface separately.
                     # (Heating in non-grid rooms is impossible by rule, so we
                     # only need the fence path here.)
@@ -629,23 +688,35 @@ def run_daily(
         # Phase 60 — build the master 47-room grid with two indicators per
         # button: is_heated_today (red bg) and is_fence_today (icon overlay).
         # "today" = report_date is in [arrival, departure).
+        # Phase 60.7 — also surface per-room override flags so the UI can
+        # show a visual marker on overridden buttons (e.g. small dot).
         _today_iso = report_date.isoformat()
         _heated_rooms_today: set[str] = set()
         _fence_rooms_today: set[str] = set()
+        # room → today's in-house stay (for override transparency)
+        _today_stay_by_room: dict[str, dict] = {}
         for _s in _window_stays:
             if _s["arrival"] <= _today_iso < _s["departure"]:
                 if _s["heated"]:
                     _heated_rooms_today.add(_s["room"])
                 if _s["fence"]:
                     _fence_rooms_today.add(_s["room"])
+                _today_stay_by_room[_s["room"]] = _s
 
         for _hr in HEATABLE_ROOMS:
+            _today_stay = _today_stay_by_room.get(_hr["room"])
             pool_heating_grid.append({
                 "room": _hr["room"],
                 "type_code": _hr["type_code"],
                 "description": _hr["description"],
                 "is_heated_today": _hr["room"] in _heated_rooms_today,
                 "is_fence_today": _hr["room"] in _fence_rooms_today,
+                # Phase 60.7 — override transparency. None when no in-house
+                # stay or no override; bool when an override is active.
+                "override_heating": (_today_stay or {}).get("override_heating"),
+                "override_fence":   (_today_stay or {}).get("override_fence"),
+                "auto_heated":      (_today_stay or {}).get("auto_heated"),
+                "auto_fence":       (_today_stay or {}).get("auto_fence"),
             })
 
         # Phase 60 — calendar payload (Gantt source data).
@@ -672,10 +743,15 @@ def run_daily(
             for _s in _other_fence_stays
         ]
 
+        _override_in_use = sum(
+            1 for _g in pool_heating_grid
+            if _g.get("override_heating") is not None or _g.get("override_fence") is not None
+        )
         print(
             f"[4c/5] Pool heating: legacy={len(pool_heating_data)} rooms, "
             f"grid={len(pool_heating_grid)} buttons "
-            f"({len(_heated_rooms_today)} red, {len(_fence_rooms_today)} fence today), "
+            f"({len(_heated_rooms_today)} red, {len(_fence_rooms_today)} fence today, "
+            f"{_override_in_use} overridden), "
             f"calendar={len(_window_stays)} stays, "
             f"other-fence={len(pool_fence_other_rooms)} non-grid stays over "
             f"{_window_start} → {_window_end} ({_raw_count} active in window)"
