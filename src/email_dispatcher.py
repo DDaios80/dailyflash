@@ -1,4 +1,4 @@
-"""Email dispatcher — Railway cron entrypoint (06:00 Europe/Athens).
+"""Email dispatcher — Railway cron entrypoint (08:00 Europe/Athens).
 
 Triggers the Lovable Cloud `send-flash-email` edge function, which fans out
 role-tailored flash emails via Resend to every user in the auth table.

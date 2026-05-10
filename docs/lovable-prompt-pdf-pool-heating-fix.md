@@ -121,7 +121,7 @@ Then download the PDF and check:
 ## Also fix `send-flash-email` (the morning briefing template)
 
 Same data shape, same bug. The morning email that goes to ~64 recipients
-at 06:00 Athens almost certainly reads `payload.pool_heating[]` too and
+at 08:00 Athens almost certainly reads `payload.pool_heating[]` too and
 renders the same 34-room mess. Apply the EXACT same field swap there:
 
 - Heating list → `pool_heating_grid` filtered to `is_heated_today === true`
@@ -141,7 +141,7 @@ those instead of the combined list. If it only has one combined section,
 split it into two (heating + fence) the same way the PDF does — the
 operations team needs them separate because the actions are independent.
 
-Verification for the email: after the next 06:00 morning briefing,
+Verification for the email: after the next 08:00 Athens morning briefing,
 check Thelxi's or any recipient's inbox. The "Pool heating today" line
 should match the count returned by the SQL query in the verification
 section above (8 tonight). If still 34, the email template wasn't
