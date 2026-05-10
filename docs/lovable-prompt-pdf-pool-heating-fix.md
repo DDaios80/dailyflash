@@ -118,11 +118,40 @@ Then download the PDF and check:
    by-category breakdown summing to that count.
 4. Legacy combined list of 34 rooms is GONE.
 
+## Also fix `send-flash-email` (the morning briefing template)
+
+Same data shape, same bug. The morning email that goes to ~64 recipients
+at 06:00 Athens almost certainly reads `payload.pool_heating[]` too and
+renders the same 34-room mess. Apply the EXACT same field swap there:
+
+- Heating list → `pool_heating_grid` filtered to `is_heated_today === true`
+- Fence list → `pool_heating_grid` filtered to `is_fence_today === true`
+  + `pool_fence_other_rooms` filtered to `in_house_today === true`,
+  deduped by room number
+- Cleaning section → `pool_cleaning.today` (count + by_category breakdown)
+
+The email template typically uses different HTML/components from the PDF
+but the data accessors are the same. Find the function or shared helper
+that builds the pool block and update it once; both surfaces should
+inherit the fix.
+
+If the email template has separate "Pool Heating" and "Pool Fence"
+sections (mirroring the PDF subsections that are empty today), populate
+those instead of the combined list. If it only has one combined section,
+split it into two (heating + fence) the same way the PDF does — the
+operations team needs them separate because the actions are independent.
+
+Verification for the email: after the next 06:00 morning briefing,
+check Thelxi's or any recipient's inbox. The "Pool heating today" line
+should match the count returned by the SQL query in the verification
+section above (8 tonight). If still 34, the email template wasn't
+updated and needs a follow-up.
+
 ## Out of scope
 
-- Email body for the morning briefing (separate template, may also need
-  the same fix).
-- Dashboard panel rendering (Phase 60 component is already in flight).
+- Dashboard panel rendering (Phase 60 component is already in flight
+  on Lovable's side; uses the same fields, will reflect correctly once
+  rendered).
 - C2BSP edge case for cleaning count (one pool per combined-suite
-  booking is already handled by the count logic; PDF just renders
+  booking is already handled by the count logic; PDF/email just renders
   whatever the count is).
