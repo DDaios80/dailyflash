@@ -123,6 +123,8 @@ def assemble_payload_in_memory(
     pool_cleaning: dict | None = None,
     pool_cleaning_grid: list[dict] | None = None,
     pool_cleaning_calendar: dict | None = None,
+    pool_fence_grid: list[dict] | None = None,
+    pool_fence_calendar: dict | None = None,
     birthdays_override: list[dict] | None = None,
     zoho_data: dict[str, list[dict]] | None = None,
 ) -> dict:
@@ -220,6 +222,11 @@ def assemble_payload_in_memory(
         # layout (14-day Gantt + 137-button grid grouped by type code).
         "pool_cleaning_grid": pool_cleaning_grid or [],
         "pool_cleaning_calendar": pool_cleaning_calendar or {"window": {}, "stays": []},
+        # Phase 61.2 — same layout for fences. Unifies the Phase 60.1 fence
+        # data (47-room grid is_fence_today + non-grid pool_fence_other_rooms)
+        # into a single 137-button grid and a fence-only calendar.
+        "pool_fence_grid": pool_fence_grid or [],
+        "pool_fence_calendar": pool_fence_calendar or {"window": {}, "stays": []},
         "daily_briefing": daily_briefing,
         "promoted_rooms": sorted(promoted_rooms),
         "totals": {
@@ -937,6 +944,81 @@ def run_daily(
         except NameError:
             pool_cleaning_calendar = {"window": {}, "stays": []}
 
+    # Phase 61.2 — pool fence grid + calendar (mirror Phase 60 heating layout
+    # for fences). Same 137-button universe as cleaning since fence requests
+    # can come from any private-pool room — heatable or not. Reuses the
+    # already-computed pool_heating_grid[].is_fence_today (heatable rooms)
+    # and pool_fence_other_rooms (non-heatable) to merge into a single grid.
+    pool_fence_grid: list[dict] = []
+    pool_fence_calendar: dict = {"window": {}, "stays": []}
+    try:
+        from pool_rooms import POOL_ROOMS as _PR_ALL, primary_category as _pc_primary
+
+        # Set of rooms with an active fence request today (in-house tonight).
+        _fence_today_rooms: set[str] = set()
+        for _g in pool_heating_grid:
+            if _g.get("is_fence_today"):
+                _fence_today_rooms.add(_g["room"])
+        for _o in pool_fence_other_rooms:
+            if _o.get("in_house_today"):
+                _fence_today_rooms.add(_o["room"])
+
+        # 137-button grid in registry order — identical shape to
+        # pool_cleaning_grid except the boolean is_fence_today.
+        for _pr in _PR_ALL:
+            pool_fence_grid.append({
+                "room": _pr["room"],
+                "type_code": _pr["type_code"],
+                "description": _pr["description"],
+                "heatable": _pr["heatable"],
+                "is_fence_today": _pr["room"] in _fence_today_rooms,
+            })
+
+        # Calendar — fence stays only across both sources, deduped by
+        # (room, arrival, departure). Same window as heating/cleaning.
+        _fence_stays_dedup: dict[tuple, dict] = {}
+        for _s in pool_heating_calendar.get("stays", []):
+            if not _s.get("fence"):
+                continue
+            _key = (_s.get("room"), _s.get("arrival"), _s.get("departure"))
+            _fs = dict(_s)
+            if "type_code" not in _fs:
+                _fs["type_code"] = _pc_primary(_fs.get("room"))
+            _fence_stays_dedup[_key] = _fs
+        for _o in pool_fence_other_rooms:
+            _key = (_o.get("room"), _o.get("arrival"), _o.get("departure"))
+            if _key in _fence_stays_dedup:
+                continue
+            _fs = dict(_o)
+            if "type_code" not in _fs:
+                _fs["type_code"] = _pc_primary(_fs.get("room"))
+            # Normalize the shape — non-grid stays don't have heated/fence
+            # booleans by default, but the calendar consumer may expect them.
+            _fs.setdefault("fence", True)
+            _fs.setdefault("heated", False)
+            _fence_stays_dedup[_key] = _fs
+
+        _fence_stays_list = sorted(
+            _fence_stays_dedup.values(),
+            key=lambda s: (s.get("arrival") or "", s.get("room") or ""),
+        )
+
+        pool_fence_calendar = {
+            "window": dict(pool_heating_calendar.get("window") or {}),
+            "stays": _fence_stays_list,
+        }
+
+        print(
+            f"[4e/5] Pool fence: grid={len(pool_fence_grid)} buttons "
+            f"({len(_fence_today_rooms)} fence today), "
+            f"calendar={len(_fence_stays_list)} fence stays in window"
+        )
+    except Exception as _e:
+        print(
+            f"[4e/5] Pool fence grid compute failed (continuing with empty): "
+            f"{type(_e).__name__}: {_e}"
+        )
+
     # Step 5 — assemble + build envelope + POST
     flash_report_payload = assemble_payload_in_memory(
         records, extractions_by_rnid, findings_by_rnid,
@@ -950,6 +1032,8 @@ def run_daily(
         pool_cleaning=pool_cleaning,
         pool_cleaning_grid=pool_cleaning_grid,
         pool_cleaning_calendar=pool_cleaning_calendar,
+        pool_fence_grid=pool_fence_grid,
+        pool_fence_calendar=pool_fence_calendar,
     )
     envelope = build_envelope(
         report_date=report_date,
