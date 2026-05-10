@@ -121,6 +121,8 @@ def assemble_payload_in_memory(
     pool_heating_calendar: dict | None = None,
     pool_fence_other_rooms: list[dict] | None = None,
     pool_cleaning: dict | None = None,
+    pool_cleaning_grid: list[dict] | None = None,
+    pool_cleaning_calendar: dict | None = None,
     birthdays_override: list[dict] | None = None,
     zoho_data: dict[str, list[dict]] | None = None,
 ) -> dict:
@@ -213,6 +215,11 @@ def assemble_payload_in_memory(
         "pool_fence_other_rooms": pool_fence_other_rooms or [],
         # Phase 61 — pool cleaning forecast for the maintenance coordinator.
         "pool_cleaning": pool_cleaning or {"window": {}, "today": {}, "forecast": [], "all_days": []},
+        # Phase 61.1 — same shape as pool_heating_grid / pool_heating_calendar
+        # so the explore-page Pool Cleaning panel can mirror the Pool Heating
+        # layout (14-day Gantt + 137-button grid grouped by type code).
+        "pool_cleaning_grid": pool_cleaning_grid or [],
+        "pool_cleaning_calendar": pool_cleaning_calendar or {"window": {}, "stays": []},
         "daily_briefing": daily_briefing,
         "promoted_rooms": sorted(promoted_rooms),
         "totals": {
@@ -834,15 +841,101 @@ def run_daily(
             "forecast": _all_days[1:],
             "all_days": _all_days,
         }
+
+        # Phase 61.1 — mirror the Phase 60 heating layout for cleaning:
+        # `pool_cleaning_grid` (137 buttons grouped by type) +
+        # `pool_cleaning_calendar` (14-day Gantt of pool-room stays).
+        # Window matches the heating calendar exactly so the two panels
+        # render side by side with the same time axis.
+        from pool_rooms import POOL_ROOMS, primary_category
+        _pc_window_start = report_date - timedelta(days=1)
+        _pc_window_end = report_date + timedelta(days=12)
+        _pc_today_iso = report_date.isoformat()
+
+        # Collect every in-pool-room stay overlapping the 14-day window.
+        _pc_stays: list[dict] = []
+        for _r in records:
+            _arr = _r.get("arrival")
+            _dep = _r.get("departure")
+            if isinstance(_arr, datetime):
+                _arr = _arr.date()
+            if isinstance(_dep, datetime):
+                _dep = _dep.date()
+            if not isinstance(_arr, date) or not isinstance(_dep, date):
+                continue
+            _room = _r.get("room")
+            if not _room or _room not in POOL_ROOM_NUMBERS:
+                continue
+            if not (_arr <= _pc_window_end and _dep >= _pc_window_start):
+                continue
+            _pc_full_name = (
+                (_r.get("guest_first_name") or "").strip()
+                + " "
+                + (_r.get("guest_name") or "").strip()
+            ).strip() or (_r.get("guest_name") or "")
+            _pc_stays.append({
+                "room": _room,
+                "guest_name": _r.get("guest_name"),
+                "guest_full_name": _pc_full_name,
+                "arrival": _arr.isoformat(),
+                "departure": _dep.isoformat(),
+                "nights": (_dep - _arr).days,
+                "type_code": primary_category(_room),
+                "booked_room_category_label": _r.get("booked_room_category_label"),
+                "room_category_label": _r.get("room_category_label"),
+            })
+
+        # Today's occupied set drives is_to_clean_today on the grid.
+        _pc_occupied_today: set[str] = set()
+        for _s in _pc_stays:
+            if _s["arrival"] <= _pc_today_iso < _s["departure"]:
+                _pc_occupied_today.add(_s["room"])
+
+        # 137-button grid in registry order (same shape as pool_heating_grid).
+        pool_cleaning_grid: list[dict] = []
+        for _pr in POOL_ROOMS:
+            pool_cleaning_grid.append({
+                "room": _pr["room"],
+                "type_code": _pr["type_code"],
+                "description": _pr["description"],
+                "heatable": _pr["heatable"],
+                "is_to_clean_today": _pr["room"] in _pc_occupied_today,
+            })
+
+        # Calendar payload (Gantt source) — every in-pool-room stay in window.
+        _pc_stays.sort(key=lambda s: (s["arrival"], s["room"]))
+        pool_cleaning_calendar: dict = {
+            "window": {
+                "start": _pc_window_start.isoformat(),
+                "end": _pc_window_end.isoformat(),
+                "anchor": report_date.isoformat(),
+                "days": (_pc_window_end - _pc_window_start).days + 1,
+            },
+            "stays": _pc_stays,
+        }
+
         print(
             f"[4d/5] Pool cleaning: today={pool_cleaning['today']['count']} pools to clean, "
-            f"7-day total={sum(d['count'] for d in _all_days)} cleanings"
+            f"7-day total={sum(d['count'] for d in _all_days)} cleanings | "
+            f"grid={len(pool_cleaning_grid)} buttons "
+            f"({len(_pc_occupied_today)} occupied today), "
+            f"calendar={len(_pc_stays)} stays over {_pc_window_start} → {_pc_window_end}"
         )
     except Exception as _e:
         print(
             f"[4d/5] Pool cleaning compute failed (continuing with empty data): "
             f"{type(_e).__name__}: {_e}"
         )
+        # Ensure the new fields exist even when compute fails so downstream
+        # rendering doesn't crash on missing keys.
+        try:
+            pool_cleaning_grid  # type: ignore[name-defined]
+        except NameError:
+            pool_cleaning_grid = []
+        try:
+            pool_cleaning_calendar  # type: ignore[name-defined]
+        except NameError:
+            pool_cleaning_calendar = {"window": {}, "stays": []}
 
     # Step 5 — assemble + build envelope + POST
     flash_report_payload = assemble_payload_in_memory(
@@ -855,6 +948,8 @@ def run_daily(
         pool_heating_calendar=pool_heating_calendar,
         pool_fence_other_rooms=pool_fence_other_rooms,
         pool_cleaning=pool_cleaning,
+        pool_cleaning_grid=pool_cleaning_grid,
+        pool_cleaning_calendar=pool_cleaning_calendar,
     )
     envelope = build_envelope(
         report_date=report_date,
