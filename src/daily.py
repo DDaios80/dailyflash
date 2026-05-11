@@ -125,6 +125,9 @@ def assemble_payload_in_memory(
     pool_cleaning_calendar: dict | None = None,
     pool_fence_grid: list[dict] | None = None,
     pool_fence_calendar: dict | None = None,
+    cribs: dict | None = None,
+    cribs_grid: list[dict] | None = None,
+    cribs_calendar: dict | None = None,
     birthdays_override: list[dict] | None = None,
     zoho_data: dict[str, list[dict]] | None = None,
 ) -> dict:
@@ -227,6 +230,12 @@ def assemble_payload_in_memory(
         # into a single 137-button grid and a fence-only calendar.
         "pool_fence_grid": pool_fence_grid or [],
         "pool_fence_calendar": pool_fence_calendar or {"window": {}, "stays": []},
+        # Phase 62 — Cribs grid + calendar + summary, clone of the pool
+        # heating/cleaning layout for housekeeping crib operations
+        # (delivery, pickup, in-room management).
+        "cribs": cribs or {"window": {}, "today": {}, "forecast": [], "all_days": []},
+        "cribs_grid": cribs_grid or [],
+        "cribs_calendar": cribs_calendar or {"window": {}, "stays": []},
         "daily_briefing": daily_briefing,
         "promoted_rooms": sorted(promoted_rooms),
         "totals": {
@@ -1019,6 +1028,179 @@ def run_daily(
             f"{type(_e).__name__}: {_e}"
         )
 
+    # Phase 62 — Cribs grid + calendar (clone of Phase 60/61 layout) for
+    # housekeeping crib delivery / pickup planning. Unlike pool heating
+    # (fixed 47-room registry) or pool cleaning (fixed 137-room registry),
+    # cribs are mobile equipment — any room can request one. So the grid
+    # is dynamic: only rooms with cribs in the 14-day window appear.
+    cribs: dict = {"window": {}, "today": {}, "forecast": [], "all_days": []}
+    cribs_grid: list[dict] = []
+    cribs_calendar: dict = {"window": {}, "stays": []}
+    try:
+        from collections import defaultdict as _cribs_dd
+
+        _cb_window_start = report_date - timedelta(days=1)
+        _cb_window_end = report_date + timedelta(days=12)
+        _cb_today_iso = report_date.isoformat()
+
+        # Collect every stay in the window with cribs > 0.
+        _cb_stays: list[dict] = []
+        for _r in records:
+            _arr = _r.get("arrival")
+            _dep = _r.get("departure")
+            if isinstance(_arr, datetime):
+                _arr = _arr.date()
+            if isinstance(_dep, datetime):
+                _dep = _dep.date()
+            if not isinstance(_arr, date) or not isinstance(_dep, date):
+                continue
+            _crib_count = _r.get("cribs") or 0
+            try:
+                _crib_count = int(_crib_count)
+            except (ValueError, TypeError):
+                _crib_count = 0
+            if _crib_count <= 0:
+                continue
+            if not (_arr <= _cb_window_end and _dep >= _cb_window_start):
+                continue
+            _room = _r.get("room")
+            _full_name = (
+                (_r.get("guest_first_name") or "").strip()
+                + " "
+                + (_r.get("guest_name") or "").strip()
+            ).strip() or (_r.get("guest_name") or "")
+            _children = _r.get("children") or 0
+            try:
+                _children = int(_children)
+            except (ValueError, TypeError):
+                _children = 0
+            _cb_stays.append({
+                "room": _room,
+                "guest_name": _r.get("guest_name"),
+                "guest_full_name": _full_name,
+                "arrival": _arr.isoformat(),
+                "departure": _dep.isoformat(),
+                "nights": (_dep - _arr).days,
+                "cribs": _crib_count,
+                "children": _children,
+                "room_category_label": _r.get("room_category_label"),
+                "booked_room_category_label": _r.get("booked_room_category_label"),
+            })
+
+        # Today's crib state: rooms with at least one crib in-house tonight,
+        # plus the count of cribs per room (multi-crib bookings supported).
+        _cb_today_by_room: dict[str, dict] = {}
+        _cb_today_total = 0
+        for _s in _cb_stays:
+            if not (_s["arrival"] <= _cb_today_iso < _s["departure"]):
+                continue
+            _room = _s["room"]
+            if not _room:
+                continue
+            if _room not in _cb_today_by_room:
+                _cb_today_by_room[_room] = {
+                    "room": _room,
+                    "cribs": 0,
+                    "children": 0,
+                    "guests": [],
+                    "guest_full_name": _s["guest_full_name"],
+                }
+            _cb_today_by_room[_room]["cribs"] += _s["cribs"]
+            _cb_today_by_room[_room]["children"] += _s["children"]
+            _cb_today_by_room[_room]["guests"].append(_s["guest_full_name"])
+            _cb_today_total += _s["cribs"]
+
+        # 7-day forecast (matches pool_cleaning shape).
+        _cb_forecast_days = 7
+        _cb_all_days: list[dict] = []
+        for _offset in range(_cb_forecast_days):
+            _d = report_date + timedelta(days=_offset)
+            _d_iso = _d.isoformat()
+            _day_rooms: set[str] = set()
+            _day_total = 0
+            for _s in _cb_stays:
+                if _s["arrival"] <= _d_iso < _s["departure"] and _s["room"]:
+                    _day_rooms.add(_s["room"])
+                    _day_total += _s["cribs"]
+            _cb_all_days.append({
+                "date": _d_iso,
+                "cribs": _day_total,
+                "rooms": len(_day_rooms),
+            })
+
+        # Dynamic grid: every room with at least one crib stay in the
+        # window. Each entry carries today's crib count (0 if not in-house
+        # tonight) and the total stays touching the window.
+        _rooms_in_window: dict[str, dict] = {}
+        for _s in _cb_stays:
+            _room = _s["room"]
+            if not _room:
+                continue
+            if _room not in _rooms_in_window:
+                _rooms_in_window[_room] = {
+                    "room": _room,
+                    "stays_in_window": 0,
+                    "max_cribs_in_window": 0,
+                }
+            _rooms_in_window[_room]["stays_in_window"] += 1
+            _rooms_in_window[_room]["max_cribs_in_window"] = max(
+                _rooms_in_window[_room]["max_cribs_in_window"], _s["cribs"]
+            )
+
+        for _room, _info in sorted(_rooms_in_window.items()):
+            _today_entry = _cb_today_by_room.get(_room) or {}
+            cribs_grid.append({
+                "room": _room,
+                "is_crib_today": bool(_today_entry),
+                "cribs_today": _today_entry.get("cribs", 0),
+                "children_today": _today_entry.get("children", 0),
+                "stays_in_window": _info["stays_in_window"],
+                "max_cribs_in_window": _info["max_cribs_in_window"],
+            })
+
+        # Calendar (Gantt source) — every crib stay in the window, sorted
+        # by arrival then room.
+        _cb_stays.sort(key=lambda s: (s["arrival"], s["room"] or ""))
+        cribs_calendar = {
+            "window": {
+                "start": _cb_window_start.isoformat(),
+                "end": _cb_window_end.isoformat(),
+                "anchor": report_date.isoformat(),
+                "days": (_cb_window_end - _cb_window_start).days + 1,
+            },
+            "stays": _cb_stays,
+        }
+
+        cribs = {
+            "window": {
+                "start": report_date.isoformat(),
+                "end": (report_date + timedelta(days=_cb_forecast_days - 1)).isoformat(),
+                "days": _cb_forecast_days,
+            },
+            "today": {
+                "date": _cb_today_iso,
+                "count": _cb_today_total,
+                "rooms": sorted(
+                    _cb_today_by_room.values(),
+                    key=lambda r: r["room"] or "",
+                ),
+            },
+            "forecast": _cb_all_days[1:],
+            "all_days": _cb_all_days,
+        }
+
+        print(
+            f"[4f/5] Cribs: today={_cb_today_total} cribs in {len(_cb_today_by_room)} rooms, "
+            f"grid={len(cribs_grid)} rooms with cribs in window, "
+            f"calendar={len(_cb_stays)} stays over "
+            f"{_cb_window_start} → {_cb_window_end}"
+        )
+    except Exception as _e:
+        print(
+            f"[4f/5] Cribs compute failed (continuing with empty data): "
+            f"{type(_e).__name__}: {_e}"
+        )
+
     # Step 5 — assemble + build envelope + POST
     flash_report_payload = assemble_payload_in_memory(
         records, extractions_by_rnid, findings_by_rnid,
@@ -1034,6 +1216,9 @@ def run_daily(
         pool_cleaning_calendar=pool_cleaning_calendar,
         pool_fence_grid=pool_fence_grid,
         pool_fence_calendar=pool_fence_calendar,
+        cribs=cribs,
+        cribs_grid=cribs_grid,
+        cribs_calendar=cribs_calendar,
     )
     envelope = build_envelope(
         report_date=report_date,
