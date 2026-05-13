@@ -78,10 +78,18 @@ def sync() -> dict:
     Safe to run repeatedly — server-side dedups by attachment_path / onedrive_item_id."""
     ingest_url = os.environ.get("INGEST_SITE_INSPECTION_URL")
     secret     = os.environ.get("PIPELINE_SECRET")
-    user_id    = os.environ.get("ONEDRIVE_FAM_IMPORT_USER_ID")
+    # Accept either spelling — Railway's env var was historically named
+    # ONE_DRIVE_FAM_IMPORT_USER_ID (with underscore between ONE and DRIVE)
+    # while the docstring + code reference ONEDRIVE_FAM_IMPORT_USER_ID.
+    # The mismatch silently no-op'd both syncs from Phase 28 / Phase 44
+    # until 2026-05-12. Fall back to the legacy spelling so either works.
+    user_id    = (
+        os.environ.get("ONEDRIVE_FAM_IMPORT_USER_ID")
+        or os.environ.get("ONE_DRIVE_FAM_IMPORT_USER_ID")
+    )
     if not ingest_url or not secret or not user_id:
         print("[inspection-sync] skipped — INGEST_SITE_INSPECTION_URL / PIPELINE_SECRET / "
-              "ONEDRIVE_FAM_IMPORT_USER_ID not set",
+              "ONEDRIVE_FAM_IMPORT_USER_ID (or legacy ONE_DRIVE_FAM_IMPORT_USER_ID) not set",
               file=sys.stderr)
         return {"imported": 0, "skipped": 0, "errors": 0, "warnings": 1}
 

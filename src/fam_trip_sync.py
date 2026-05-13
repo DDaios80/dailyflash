@@ -93,9 +93,18 @@ def sync() -> dict:
     Safe to run repeatedly — server-side dedups by pdf_filename."""
     ingest_url = os.environ.get("INGEST_FAM_TRIP_URL")
     secret     = os.environ.get("PIPELINE_SECRET")
-    user_id    = os.environ.get("ONEDRIVE_FAM_IMPORT_USER_ID")
+    # Accept either spelling — Railway's env var was historically named
+    # ONE_DRIVE_FAM_IMPORT_USER_ID (underscore between ONE and DRIVE) while
+    # the code uses ONEDRIVE_FAM_IMPORT_USER_ID. The mismatch silently
+    # no-op'd FAM + inspection sync since Phase 28 / Phase 44. Fall back
+    # to the legacy name so either works.
+    user_id    = (
+        os.environ.get("ONEDRIVE_FAM_IMPORT_USER_ID")
+        or os.environ.get("ONE_DRIVE_FAM_IMPORT_USER_ID")
+    )
     if not ingest_url or not secret or not user_id:
-        print("[fam-sync] skipped — INGEST_FAM_TRIP_URL / PIPELINE_SECRET / ONEDRIVE_FAM_IMPORT_USER_ID not set",
+        print("[fam-sync] skipped — INGEST_FAM_TRIP_URL / PIPELINE_SECRET / "
+              "ONEDRIVE_FAM_IMPORT_USER_ID (or legacy ONE_DRIVE_FAM_IMPORT_USER_ID) not set",
               file=sys.stderr)
         return {"imported": 0, "skipped": 0, "errors": 0, "warnings": 1}
 
