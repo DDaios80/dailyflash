@@ -111,7 +111,67 @@ def _trigger_email_sync(target_date_iso: str) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-async def _run_pipeline(run_id: str, flags: list[str], target_date_iso: str | None) -> None:
+# Phase 23b — write back to flash_reissue_log when the cron pipeline
+# actually finishes. Single source of truth: the Python process owns
+# the subprocess and KNOWS when it exits. Replaces the edge function's
+# unreliable finishLog call (which never reaches the 90s timeout path —
+# see docs/phase23b-reissue-architectural-fix.md for the diagnosis).
+def _finish_reissue_log(
+    log_run_id: str,
+    status: str,
+    payload_updated: bool,
+    email_triggered: bool,
+    error: str | None,
+) -> dict:
+    """Best-effort POST to PostgREST `flash_reissue_log_finish` RPC.
+
+    Errors are swallowed (logged to stderr only). Phase 23a's 2-min sweep
+    is the safety net: a 'running' row > 2 min old gets superseded by the
+    next preview read, so even if this write fails Thelxi won't be locked
+    out. The write here is what turns the UI's polling indicator green.
+    """
+    supabase_url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    service_key  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not log_run_id or not supabase_url or not service_key:
+        return {"ok": False, "skipped": "missing log_run_id / SUPABASE_URL / SERVICE_ROLE_KEY"}
+
+    url = f"{supabase_url}/rest/v1/rpc/flash_reissue_log_finish"
+    payload = json.dumps({
+        "p_id": log_run_id,
+        "p_status": status,
+        "p_payload_updated": payload_updated,
+        "p_email_triggered": email_triggered,
+        "p_error": error,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "apikey": service_key,
+            "Authorization": f"Bearer {service_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return {"ok": resp.status < 300, "status": resp.status}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:300]
+        print(f"[webhook] _finish_reissue_log HTTP {e.code}: {body}", file=sys.stderr)
+        return {"ok": False, "status": e.code, "body": body}
+    except Exception as e:
+        print(f"[webhook] _finish_reissue_log failed (non-fatal): {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+async def _run_pipeline(
+    run_id: str,
+    flags: list[str],
+    target_date_iso: str | None,
+    log_run_id: str | None = None,
+) -> None:
     """Execute src/cron.py in a subprocess; capture stdout/stderr.
 
     On successful completion (returncode == 0), auto-trigger
@@ -119,10 +179,22 @@ async def _run_pipeline(run_id: str, flags: list[str], target_date_iso: str | No
     on the edge function still polling. Without this, runs that exceed
     the edge function's 90s poll deadline would silently update the
     payload but never email anyone.
+
+    Phase 23b — if `log_run_id` is provided (passed by the edge function
+    in the POST body), finalize the matching flash_reissue_log row when
+    cron exits. This replaces the edge function's unreliable finishLog
+    call. Best-effort: errors don't fail the run.
     """
     global _current, _last
     cmd = [sys.executable, "-u", "src/cron.py", *flags]
     _current["cmd"] = cmd
+
+    # Phase 23b — track final values for flash_reissue_log_finish.
+    log_status: str = "failed"
+    log_payload_updated: bool = False
+    log_email_triggered: bool = False
+    log_error: str | None = None
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -140,15 +212,37 @@ async def _run_pipeline(run_id: str, flags: list[str], target_date_iso: str | No
         # request) — happens after pipeline completes so timing isn't
         # critical. Result is captured on _current for /status visibility.
         if proc.returncode == 0:
+            log_status = "ok"
+            log_payload_updated = True
             email_target = target_date_iso or _athens_tomorrow_iso()
             email_result = await asyncio.to_thread(_trigger_email_sync, email_target)
             _current["email_target"] = email_target
             _current["email_result"] = email_result
+            log_email_triggered = bool(email_result.get("ok"))
+        else:
+            log_status = "failed"
+            tail = _current.get("stderr_tail") or ""
+            log_error = (tail[-500:] if tail else f"cron exited with code {proc.returncode}")
     except Exception as e:
         _current["status"] = "failed"
         _current["error"] = f"{type(e).__name__}: {e}"
+        log_status = "failed"
+        log_error = f"{type(e).__name__}: {e}"[:500]
     finally:
         _current["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Phase 23b — finalize flash_reissue_log row (best-effort).
+        if log_run_id:
+            finish_result = await asyncio.to_thread(
+                _finish_reissue_log,
+                log_run_id,
+                log_status,
+                log_payload_updated,
+                log_email_triggered,
+                log_error,
+            )
+            _current["log_finish_result"] = finish_result
+
         _last = dict(_current)
         _current = None
 
@@ -170,6 +264,10 @@ async def reissue(request: Request, authorization: str | None = Header(None)):
     #                          reissue path (target_date = tomorrow anyway
     #                          since cron.py defaults to tomorrow).
     #   { "date": "YYYY-MM-DD" } -> explicit target date
+    #   { "log_run_id": "uuid" } or { "run_id": "uuid" } -> Phase 23b — the
+    #     flash_reissue_log row id assigned by the edge function. We use it
+    #     to finalize the row when cron exits. Accepted under either key for
+    #     forward-compat with whichever name the edge function uses.
     flags: list[str] = []
     target_date_iso: str | None = None
     if isinstance(body.get("date"), str):
@@ -179,6 +277,12 @@ async def reissue(request: Request, authorization: str | None = Header(None)):
         flags.append("--today")
     if body.get("fallback_latest"):
         flags.append("--fallback-latest")
+
+    log_run_id: str | None = None
+    if isinstance(body.get("log_run_id"), str):
+        log_run_id = body["log_run_id"]
+    elif isinstance(body.get("run_id"), str):
+        log_run_id = body["run_id"]
 
     # Stale-run guard: clear _current if it's been hung > 15 min so a wedged
     # subprocess doesn't permanently lock out reissues.
@@ -232,15 +336,17 @@ async def reissue(request: Request, authorization: str | None = Header(None)):
         run_id = str(uuid.uuid4())
         _current = {
             "run_id": run_id,
+            "log_run_id": log_run_id,
             "status": "running",
             "started_at": datetime.now(timezone.utc).isoformat(),
             "flags": flags,
         }
-        asyncio.create_task(_run_pipeline(run_id, flags, target_date_iso))
+        asyncio.create_task(_run_pipeline(run_id, flags, target_date_iso, log_run_id))
 
     return {
         "ok": True,
         "run_id": run_id,
+        "log_run_id": log_run_id,
         "status": "running",
         "started_at": _current["started_at"],
         "flags": flags,
