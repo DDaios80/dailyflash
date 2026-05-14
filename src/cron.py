@@ -354,17 +354,36 @@ def main() -> int:
               file=sys.stderr)
 
     # Phase 60.3 — extraction-freshness sanity check.
-    # ingest-flash-report has historically silently dropped comment_extractions
-    # writes (April 21 → May 9 incident: 18 days of frozen extractions despite
-    # nightly cron success). After every cron run, query the DB and warn loudly
-    # if max(extracted_at) is older than today. Non-fatal but visible — the
-    # warning lands in Railway logs and surfaces the regression early.
-    if not args.quick:
-        try:
-            _check_extraction_freshness()
-        except Exception as e:
-            print(f"[cron] freshness check failed (non-fatal): {type(e).__name__}: {e}",
-                  file=sys.stderr)
+    #
+    # DISABLED 2026-05-15 (diagnostic: see this commit message).
+    #
+    # The check queries `comment_extractions` via the local supa client,
+    # which uses SUPABASE_URL from env. Local .env and (likely) Railway
+    # both point at `iylnwafwrvzwkhhskazu` — a legacy DB that stopped
+    # receiving fresh writes on 2026-04-21 when the data plane migrated
+    # to the Lovable Cloud project `wgbghdbfmapuqbfeiygb`. Production
+    # comment_extractions IS fresh on wgbghdbfmapuqbfeiygb (verified
+    # 2026-05-15 00:48 Athens: max(extracted_at) = tonight 23:18). So
+    # this check fires false-positive every night and contributed to a
+    # multi-hour debug session chasing a phantom bug.
+    #
+    # If we want a real freshness safety net, Lovable needs to expose
+    # an edge function (e.g. /functions/v1/extraction-freshness) that
+    # returns max(extracted_at) from wgbghdbfmapuqbfeiygb. Python then
+    # calls that edge function here. See
+    # docs/phase23b-reissue-architectural-fix.md for the same pattern
+    # (finalize-reissue-log).
+    #
+    # Until then: the canonical safety net is the email itself. If
+    # ingest-flash-report regresses to a no-op, tomorrow's flash will be
+    # visibly empty and we'll notice within hours.
+    #
+    # if not args.quick:
+    #     try:
+    #         _check_extraction_freshness()
+    #     except Exception as e:
+    #         print(f"[cron] freshness check failed (non-fatal): {type(e).__name__}: {e}",
+    #               file=sys.stderr)
 
     # Phase 68 — uptime heartbeat. Ping the external monitoring service to
     # confirm this run completed. If HEARTBEAT_URL env var is unset (local
