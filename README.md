@@ -33,8 +33,8 @@ This README captures the system as of **2026-05-14** (Phase 67.1). For day-by-da
 
 **Data lives in:**
 
-- **Supabase Postgres** (`Sales Explorer` project): 50+ tables, extensive RLS, ~115+ SECURITY DEFINER RPCs.
-- **Supabase Storage**: 7 buckets (`idea-photos`, `fam-trip-pdfs`, `site-inspection-pdfs`, `email-assets`, `inspection-attachments`, `exco-transcripts`, `exco-member-context`).
+- **Supabase Postgres** (main DB, project ref `iylnwafwrvzwkhhskazu`, dedicated to Daily Flash per the `.env` Phase 1 setup): 50+ tables, extensive RLS, ~115+ SECURITY DEFINER RPCs. This is where `flash_reports`, `ideas`, `comment_extractions`, etc. live.
+- **Supabase / Lovable Cloud** (project ref `wgbghdbfmapuqbfeiygb`): hosts edge functions (`send-flash-email`, `ingest-flash-report`, `analyze-idea`, etc.) and the storage buckets (`idea-photos`, `fam-trip-pdfs`, `site-inspection-pdfs`, `email-assets`, `inspection-attachments`, `exco-transcripts`, `exco-member-context` — 7 total). The Python pipeline writes to the main DB directly AND POSTs to edge functions here.
 - **Notion**: shipping log + handoff documents.
 - **OneDrive (corporate)**: source xlsx files + FAM trip + inspection PDFs.
 
@@ -191,7 +191,7 @@ railway up    # uploads current working directory as a one-shot deploy
 1. Write migration as `db/phaseN_*.sql`
 2. Commit + push to `main` (gets versioned in git)
 3. Copy file contents (`cat db/phaseN_*.sql | pbcopy`)
-4. Open Supabase SQL editor (Sales Explorer project) → new query → ⌘V → Run
+4. Open Supabase SQL editor (Flash Report project — ref `iylnwafwrvzwkhhskazu`, the main DB where you've been working all session) → new query → ⌘V → Run
 5. Verify output matches the migration's verification SELECT
 
 **Convention** (Phase 51 onwards): every new function/view migration must grant to all four PostgREST-relevant roles:
@@ -389,8 +389,10 @@ This convention is documented in `docs/2026-05-14-update-statement-audit.md` and
 - **Super-admin**: https://flashreport.daioscove.com/super-admin (requires super_admin role)
 - **Repository**: https://github.com/DDaios80/dailyflash
 - **Railway project**: helpful-patience / dailyflash service
-- **Supabase project**: Sales Explorer
-- **Lovable project**: Daios Cove Flash
+- **Supabase main DB**: Flash Report project, ref `iylnwafwrvzwkhhskazu` (manually created early Phase 1, dedicated to Daily Flash data)
+- **Lovable Cloud**: ref `wgbghdbfmapuqbfeiygb` (edge functions + storage buckets)
+- **Lovable project**: Daios Cove Flash (the user-facing React app)
+- ⚠️ **Note**: do NOT confuse with **Sales Explorer** — that's a separate Lovable app (sales analytics) on its own Supabase project, unrelated to Daily Flash
 
 ## Phase history (high level)
 

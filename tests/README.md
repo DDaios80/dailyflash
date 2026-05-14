@@ -24,16 +24,35 @@ Tests pick up Supabase credentials from `.env` at the repo root (same source as 
 
 **Expected runtime**: ~5-10 seconds for the full suite (most time is in `test_payload.py` queries).
 
-### ⚠️ Local `.env` may point to a stale/abandoned Supabase project
+### Multi-project architecture — `.env` should point to the main DB project
 
-Discovered during the Tier 2 #3 implementation (2026-05-14): the local `.env` may have `SUPABASE_URL` pointing to a project that's no longer the production target. Symptoms:
+The Daily Flash app uses **two Supabase projects**:
 
-- `test_payload.py` skips all tests with message *"No flash_reports rows in the last 7 days"*
-- A standalone Python query (`sb.table("flash_reports").select(...).limit(5).execute()`) returns only very old rows
+- **`iylnwafwrvzwkhhskazu`** — main DB project (manually created, dedicated to Daily Flash data per the `.env` Phase 1 setup). This is what `SUPABASE_URL` should point to in both your local `.env` and the Railway env vars. The `flash_reports`, `ideas`, etc. tables live here.
+- **`wgbghdbfmapuqbfeiygb`** — Lovable Cloud project (auto-created by Lovable). Hosts the edge functions (e.g., `send-flash-email`, `ingest-flash-report`) and the storage buckets (`idea-photos`, etc.). The Python pipeline POSTs to edge function URLs here (via `INGEST_FLASH_REPORT_URL` and similar env vars), but does NOT use this URL as `SUPABASE_URL`.
 
-If you see this, your `.env`'s `SUPABASE_URL` likely points at an early-Phase 1 dedicated project (e.g., `iylnwafwrvzwkhhskazu.supabase.co`) rather than the current Lovable Cloud project (`wgbghdbfmapuqbfeiygb.supabase.co` for Daios Cove). Update the `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` to the production project to make local tests query real data.
+**Correct `.env` setup**:
+```
+SUPABASE_URL=https://iylnwafwrvzwkhhskazu.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<the service_role JWT from THIS project's API page>
+INGEST_FLASH_REPORT_URL=https://wgbghdbfmapuqbfeiygb.supabase.co/functions/v1/ingest-flash-report
+```
 
-Railway production environment variables override `.env`, so the cron service on Railway has been running against the correct project all along. This is purely a local-dev gotcha.
+The two URLs are different and intentional. Same pattern in Railway env vars and in GitHub Actions secrets.
+
+**Verification** (proves both halves of the pair match):
+```bash
+python3 -c "
+import base64, json, os
+from dotenv import load_dotenv
+load_dotenv()
+key = os.environ['SUPABASE_SERVICE_ROLE_KEY']
+payload = key.split('.')[1] + '=' * (-len(key.split('.')[1]) % 4)
+print('JWT ref:', json.loads(base64.urlsafe_b64decode(payload))['ref'])
+print('URL host:', os.environ['SUPABASE_URL'].split('//')[1].split('.')[0])
+# Both should print: iylnwafwrvzwkhhskazu
+"
+```
 
 ---
 
