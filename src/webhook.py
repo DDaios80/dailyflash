@@ -116,6 +116,13 @@ def _trigger_email_sync(target_date_iso: str) -> dict:
 # the subprocess and KNOWS when it exits. Replaces the edge function's
 # unreliable finishLog call (which never reaches the 90s timeout path —
 # see docs/phase23b-reissue-architectural-fix.md for the diagnosis).
+#
+# Architectural note: flash_reissue_log lives on the Lovable Cloud
+# project (wgbghdbfmapuqbfeiygb), which Python cannot reach directly via
+# PostgREST (no service-role key exposure on Lovable projects). So we
+# POST to a dedicated edge function — `finalize-reissue-log` — that
+# Lovable hosts. It validates PIPELINE_SECRET and calls the
+# flash_reissue_log_finish RPC internally with its own service-role.
 def _finish_reissue_log(
     log_run_id: str,
     status: str,
@@ -123,39 +130,41 @@ def _finish_reissue_log(
     email_triggered: bool,
     error: str | None,
 ) -> dict:
-    """Best-effort POST to PostgREST `flash_reissue_log_finish` RPC.
+    """Best-effort POST to the `finalize-reissue-log` Lovable edge function.
 
     Errors are swallowed (logged to stderr only). Phase 23a's 2-min sweep
     is the safety net: a 'running' row > 2 min old gets superseded by the
     next preview read, so even if this write fails Thelxi won't be locked
     out. The write here is what turns the UI's polling indicator green.
     """
-    supabase_url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
-    service_key  = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    if not log_run_id or not supabase_url or not service_key:
-        return {"ok": False, "skipped": "missing log_run_id / SUPABASE_URL / SERVICE_ROLE_KEY"}
+    url = os.environ.get("FINALIZE_REISSUE_LOG_URL", "").strip()
+    secret = os.environ.get("PIPELINE_SECRET", "").strip()
+    if not log_run_id or not url or not secret:
+        return {
+            "ok": False,
+            "skipped": "missing log_run_id / FINALIZE_REISSUE_LOG_URL / PIPELINE_SECRET",
+        }
 
-    url = f"{supabase_url}/rest/v1/rpc/flash_reissue_log_finish"
     payload = json.dumps({
-        "p_id": log_run_id,
-        "p_status": status,
-        "p_payload_updated": payload_updated,
-        "p_email_triggered": email_triggered,
-        "p_error": error,
+        "run_id": log_run_id,
+        "status": status,
+        "payload_updated": payload_updated,
+        "email_triggered": email_triggered,
+        "error": error,
     }).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=payload,
         headers={
-            "apikey": service_key,
-            "Authorization": f"Bearer {service_key}",
+            "Authorization": f"Bearer {secret}",
             "Content-Type": "application/json",
         },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return {"ok": resp.status < 300, "status": resp.status}
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")[:300]
+            return {"ok": resp.status < 300, "status": resp.status, "body": body}
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:300]
         print(f"[webhook] _finish_reissue_log HTTP {e.code}: {body}", file=sys.stderr)
