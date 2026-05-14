@@ -9,3 +9,5 @@ requests>=2.31
 # Phase 23 — reissue webhook (separate Railway service)
 fastapi>=0.115
 uvicorn[standard]>=0.32
+# Tier 2 #3 — smoke test infrastructure (Phase 69, see tests/)
+pytest>=8.0

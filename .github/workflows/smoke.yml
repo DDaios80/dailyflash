@@ -1,0 +1,66 @@
+name: Smoke tests
+
+# Runs the pytest smoke suite on every push to main + every PR targeting main.
+# Tests are READ-ONLY against the live Supabase. See tests/README.md for scope.
+#
+# Required GitHub secrets (Settings → Secrets and variables → Actions):
+#   SUPABASE_URL              - same value as Railway env
+#   SUPABASE_SERVICE_ROLE_KEY - same value as Railway env
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual triggering from the Actions tab for debugging
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify required secrets are configured
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -z "$SUPABASE_URL" ]; then
+            echo "::error::SUPABASE_URL secret is not set. Configure in Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            echo "::error::SUPABASE_SERVICE_ROLE_KEY secret is not set. Configure in Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          echo "✓ Required secrets are configured"
+
+      - name: Create .env for tests
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # src/supa.py expects .env at repo root. Construct it from CI secrets.
+          # This file is NOT committed (covered by .gitignore).
+          {
+            echo "SUPABASE_URL=$SUPABASE_URL"
+            echo "SUPABASE_SERVICE_ROLE_KEY=$SUPABASE_SERVICE_ROLE_KEY"
+          } > .env
+
+      - name: Run smoke tests
+        run: pytest --tb=short -v
