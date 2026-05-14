@@ -65,6 +65,10 @@ daily-flash/
 │                            # Source of truth = Lovable Cloud. See "Edge functions" section.
 ├── lovable-edge-functions/  # Lovable-managed newer edge functions (approve-fam-trip, approve-site-inspection, ingest-site-inspection-from-onedrive)
 ├── docs/                    # Audit docs + Lovable handoff prompts + handover notes
+│                            # See docs/INDEX.md for the navigation guide
+├── tests/                   # Smoke test suite (Phase 69 / Tier 2 #3)
+│                            # See tests/README.md for scope + run instructions
+├── .github/workflows/       # CI: smoke.yml runs pytest on push to main + PRs
 ├── ops/                     # Operational scripts (manual triggers, debug helpers)
 ├── tools/                   # One-off utility scripts
 ├── samples/                 # Reference xlsx files for local testing
@@ -250,6 +254,46 @@ If `HEARTBEAT_URL` is unset, the function is a no-op — safe for local dev.
 - **Lovable Cloud edge function logs**: invocation count + duration + errors. In Lovable's dashboard.
 - **Resend dashboard**: email delivery success rates + bounces.
 - **Super-admin → System health tab**: in-app, aggregated stats from `platform_events`.
+
+---
+
+## Testing
+
+Smoke test suite at `tests/` (added 2026-05-14 as Phase 69 / Tier 2 #3). See `tests/README.md` for the full scope and run instructions.
+
+### Running locally
+
+```bash
+cd ~/daily-flash
+source .venv/bin/activate
+pip install -r requirements.txt
+pytest
+```
+
+### What's covered
+
+| Test file | Catches | Runtime |
+|---|---|---|
+| `tests/test_imports.py` | Syntax errors, missing dependencies, import-time bugs, circular imports across all `src/*.py` modules (25 parametrized cases) | ~1s, no DB |
+| `tests/test_payload.py` | Latest `flash_reports` row missing expected Phase 60-62 grids; cron stale; room counts wrong (47/137/137 invariants); legacy `pool_heating` not soft-deprecated | ~3-5s, queries Supabase |
+
+### CI integration
+
+`.github/workflows/smoke.yml` runs `pytest` on every push to `main` + every PR. Requires two GitHub secrets:
+
+- `SUPABASE_URL` — production Lovable Cloud URL
+- `SUPABASE_SERVICE_ROLE_KEY` — matching service role key
+
+If secrets are missing, the workflow fails fast at the "Verify required secrets are configured" step with a clear error message.
+
+### What's NOT covered (yet)
+
+- End-to-end pipeline run (no fresh xlsx → envelope assertion)
+- Edge function behavior (tested by humans via the morning briefing arriving correctly)
+- Business logic edge cases (smoke not regression)
+- Migration linting (future Tier 3 item)
+
+The Phase 67.1 column-name bug class would have been caught by `test_payload.py` if the bug had affected payload structure. It would have been caught by a future migration linter if implemented. Tonight's smoke tests are the first layer; CI lint is the second.
 
 ---
 
