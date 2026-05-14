@@ -243,8 +243,15 @@ Chair rotation status, Flash Report channel για ερωτήματα μέσα �
 Ευχαριστώ. Θα τα πούμε <Δευτέρα> στις 13:00.
 
 <chair name>
-Managing Director, Daios Cove
+<chair title>, Daios Cove
 ```
+
+> **Note (2026-05-15):** the chair's title must come from the user's
+> profile, not be hardcoded. The Chair role rotates weekly across
+> seven ExCo members with different titles (Managing Director,
+> Commercial Director, F&B Director, etc.). Source the title from a
+> `title` field on `user_roles` (or wherever Lovable stores profile
+> data) and substitute at render time.
 
 The user can copy the markdown from the modal and paste into email. (Resend integration deferred to Phase 70.3.)
 
