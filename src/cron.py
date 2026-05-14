@@ -27,7 +27,7 @@ import argparse
 import os
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -99,48 +99,97 @@ def main() -> int:
     ap.add_argument("--auto-quick", action="store_true",
                     help="Polling mode: detect if OneDrive xlsx was modified after the last upload's uploaded_at, and only run quick pipeline if so. Use as a 15-30 min Railway cron to pick up Thelxi's intra-day room-change re-uploads automatically.")
     ap.add_argument("--force", action="store_true",
-                    help="Bypass Phase 47 deploy-skip check (run even if RAILWAY_DEPLOYMENT_ID just changed).")
+                    help="Bypass Phase 47 v2 back-to-back skip (run even if the last successful pipeline finished < 5 min ago).")
     args = ap.parse_args()
 
-    # Phase 47 — skip cron runs triggered by Railway redeploys. Railway's
-    # cron service fires the start command on every deploy AND on the
-    # configured schedule. Without this guard, every git push to main
-    # double-runs the pipeline (waste + reissue email spam to Thelxi).
+    # Phase 47 v2 — skip cron runs that arrive within 5 min of the last
+    # successful run.
     #
-    # Mechanism: store the current RAILWAY_DEPLOYMENT_ID in app_settings.
-    # If env's deployment_id doesn't match what we stored, this is a
-    # fresh deploy — persist the new ID and exit. The next scheduled fire
-    # will see matching IDs and proceed.
+    # WHY v2: the original Phase 47 keyed off RAILWAY_DEPLOYMENT_ID and
+    # wrote to app_settings.cron_last_deployment_id. Investigation on
+    # 2026-05-14 showed the upsert never persisted the row (the row was
+    # missing from prod despite many deploys), so EVERY cron fire saw
+    # `stored = None`, declared "fresh deploy", and skipped. The cron
+    # service was effectively dead. Root cause of the silent upsert
+    # failure is still unknown — could be supabase-py quirk, RLS edge
+    # case, or wrong project URL. v2 sidesteps the question by:
     #
-    # --force bypasses this. Local runs without RAILWAY_DEPLOYMENT_ID set
-    # also bypass (the env var is only present on Railway).
-    if not args.force and os.environ.get("RAILWAY_DEPLOYMENT_ID"):
-        deployment_id = os.environ["RAILWAY_DEPLOYMENT_ID"]
+    #   1. Using a TIMESTAMP key (cron_last_finish_at) instead of a
+    #      deployment_id. A real value, never "None vs UUID" semantics.
+    #   2. Logging every branch loudly so the next time something goes
+    #      wrong it shows up in Railway logs.
+    #   3. Failing OPEN: if anything in the check fails, run the
+    #      pipeline. We'd rather run twice than not at all.
+    #
+    # Mechanism: after every successful pipeline run we upsert
+    # cron_last_finish_at = now(). On entry, if that timestamp is < 5
+    # minutes old, skip — this catches the deploy-then-scheduled
+    # back-to-back pattern. After 5 min, any subsequent cron runs
+    # normally.
+    #
+    # Edge case: if two crons fire within the same 5-min window AND
+    # neither has finished yet, both will see an old/missing timestamp
+    # and both will proceed. Race is small and produces a double-run,
+    # not a missed run. Acceptable.
+    #
+    # --force bypasses entirely.
+    PHASE47_SKIP_WINDOW_SECONDS = 300  # 5 minutes
+    if not args.force:
         try:
             from supa import client as _supa_client
             _sb = _supa_client()
             _row = (
                 _sb.table("app_settings")
-                .select("value")
-                .eq("key", "cron_last_deployment_id")
+                .select("value, updated_at")
+                .eq("key", "cron_last_finish_at")
                 .maybe_single()
                 .execute()
             )
-            _stored = (_row.data or {}).get("value") if _row else None
-            if _stored != deployment_id:
-                _sb.table("app_settings").upsert(
-                    {"key": "cron_last_deployment_id", "value": deployment_id},
-                    on_conflict="key",
-                ).execute()
-                print(
-                    f"[cron] Phase 47 deploy-skip: RAILWAY_DEPLOYMENT_ID changed "
-                    f"({_stored} → {deployment_id}). Skipping this run; "
-                    f"next scheduled fire will run normally."
-                )
-                return 0
-        except Exception as _e:
+            _data = (_row.data if _row else None) or {}
+            _stored_iso = _data.get("value")
             print(
-                f"[cron] Phase 47 deploy-skip check failed (continuing): "
+                f"[cron] Phase 47 v2 check: stored cron_last_finish_at = "
+                f"{_stored_iso!r}",
+                file=sys.stderr,
+            )
+            if _stored_iso:
+                try:
+                    last_finish = datetime.fromisoformat(
+                        _stored_iso.replace("Z", "+00:00")
+                    )
+                    age_s = (datetime.now(timezone.utc) - last_finish).total_seconds()
+                    if 0 <= age_s < PHASE47_SKIP_WINDOW_SECONDS:
+                        print(
+                            f"[cron] Phase 47 v2 skip: last successful run "
+                            f"finished {age_s:.0f}s ago "
+                            f"(< {PHASE47_SKIP_WINDOW_SECONDS}s). "
+                            f"Use --force to override."
+                        )
+                        return 0
+                    else:
+                        print(
+                            f"[cron] Phase 47 v2: last run {age_s:.0f}s ago "
+                            f"(>= {PHASE47_SKIP_WINDOW_SECONDS}s), proceeding."
+                        )
+                except (ValueError, TypeError) as _parse_e:
+                    print(
+                        f"[cron] Phase 47 v2: could not parse stored timestamp "
+                        f"{_stored_iso!r}: {type(_parse_e).__name__}: {_parse_e}. "
+                        f"Failing open — proceeding.",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    f"[cron] Phase 47 v2: no cron_last_finish_at yet "
+                    f"(first run or row not written). Proceeding.",
+                    file=sys.stderr,
+                )
+        except Exception as _e:
+            # Fail OPEN. The point of this block is to suppress redundant
+            # deploy-triggered crons, not to be a hard gate. If the DB is
+            # unreachable, we'd rather run than not.
+            print(
+                f"[cron] Phase 47 v2 check failed (continuing fail-open): "
                 f"{type(_e).__name__}: {_e}",
                 file=sys.stderr,
             )
@@ -329,6 +378,41 @@ def main() -> int:
     except Exception as e:
         print(f"[cron] heartbeat module failed (non-fatal): {type(e).__name__}: {e}",
               file=sys.stderr)
+
+    # Phase 47 v2 — record successful finish so the next cron within 5 min
+    # skips itself. Loud logging on success AND failure so the next time
+    # the upsert silently fails (like the v1 cron_last_deployment_id row
+    # did), we see it in Railway logs immediately.
+    try:
+        from supa import client as _supa_client
+        _now_iso = datetime.now(timezone.utc).isoformat()
+        _resp = (
+            _supa_client()
+            .table("app_settings")
+            .upsert(
+                {"key": "cron_last_finish_at", "value": _now_iso},
+                on_conflict="key",
+            )
+            .execute()
+        )
+        _resp_data = getattr(_resp, "data", None)
+        if _resp_data:
+            print(f"[cron] Phase 47 v2: wrote cron_last_finish_at = {_now_iso}")
+        else:
+            # If supabase-py returns no data on a successful upsert this
+            # is normal; but it also masked the v1 silent-fail. Log the
+            # raw response so we have a paper trail.
+            print(
+                f"[cron] Phase 47 v2: upsert returned no data — "
+                f"response repr: {_resp!r}",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(
+            f"[cron] Phase 47 v2: failed to persist cron_last_finish_at "
+            f"(non-fatal): {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
 
     return 0
 
