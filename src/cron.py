@@ -317,6 +317,19 @@ def main() -> int:
             print(f"[cron] freshness check failed (non-fatal): {type(e).__name__}: {e}",
                   file=sys.stderr)
 
+    # Phase 68 — uptime heartbeat. Ping the external monitoring service to
+    # confirm this run completed. If HEARTBEAT_URL env var is unset (local
+    # dev or ops without monitoring configured), this is a no-op. If the
+    # ping fails for any reason, log to stderr and continue — heartbeat
+    # outages must never cause cron to fail. See src/heartbeat.py + the
+    # README's "Monitoring" section for setup details.
+    try:
+        from heartbeat import ping_heartbeat
+        ping_heartbeat(label="auto-quick" if args.auto_quick else ("quick" if args.quick else "daily"))
+    except Exception as e:
+        print(f"[cron] heartbeat module failed (non-fatal): {type(e).__name__}: {e}",
+              file=sys.stderr)
+
     return 0
 
 
