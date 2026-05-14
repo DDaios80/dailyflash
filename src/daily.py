@@ -206,14 +206,18 @@ def assemble_payload_in_memory(
         "allergies_in_house": _enrich(flash.allergies_in_house),
         "alister_findings": al_panel_rows,
         "alister_findings_count": len(al_panel_rows),
-        "pool_heating": pool_heating or [],
+        # Phase 60 follow-up (2026-05-14): legacy `pool_heating` field is
+        # soft-deprecated. Always empty going forward. All consumers should
+        # use `pool_heating_grid` filtered by `is_heated_today` instead.
+        # Kept as an empty list so any forgotten reader gets empty data
+        # rather than KeyError. Full removal targeted for ~2026-05-21 after
+        # a week of production soak with no complaints.
+        "pool_heating": [],
         # Phase 60 — new structures for the redesigned pool-heating UI.
         # `pool_heating_grid` = master list of all 47 heatable rooms with
         # per-room "is heated today" state (red button when true).
         # `pool_heating_calendar` = heated stays in the 14-day window for the
         # Gantt-style calendar above the grid.
-        # The legacy `pool_heating` field stays for one cycle so the existing
-        # dashboard rendering doesn't break during the Lovable migration.
         "pool_heating_grid": pool_heating_grid or [],
         "pool_heating_calendar": pool_heating_calendar or {"window": {}, "stays": []},
         # Phase 60.1 — fence requests in non-grid rooms (DLXP, DJSTEP, Collection).
