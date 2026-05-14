@@ -61,9 +61,9 @@ daily-flash/
 │   ├── schema.sql           # Initial Phase 1 schema
 │   ├── phaseN_*.sql         # Each phase = one migration applied via Supabase SQL editor
 │   └── ...                  # Currently 50+ phase files
-├── edge-functions/          # ⚠️ Local copies of Lovable Cloud edge functions
-│                            # STALE in places (see "Edge functions" section below)
-├── lovable-edge-functions/  # Lovable-managed newer edge functions
+├── edge-functions.archive-2026-05-14/  # 📦 ARCHIVED stale copies (pre-Phase 60.8).
+│                            # Source of truth = Lovable Cloud. See "Edge functions" section.
+├── lovable-edge-functions/  # Lovable-managed newer edge functions (approve-fam-trip, approve-site-inspection, ingest-site-inspection-from-onedrive)
 ├── docs/                    # Audit docs + Lovable handoff prompts + handover notes
 ├── ops/                     # Operational scripts (manual triggers, debug helpers)
 ├── tools/                   # One-off utility scripts
@@ -200,13 +200,21 @@ See Phase 63 audit and `docs/2026-05-14-update-statement-audit.md` for the struc
 
 ### Edge functions
 
-⚠️ **Two divergent sources of truth.** The `edge-functions/` folder in this repo is **stale** — it represents pre-Phase 60.8 code. The deployed versions live on Lovable Cloud and are post-Phase 60.8 (using `pool_heating_grid`, not legacy `pool_heating[]`).
+**Source of truth: Lovable Cloud.** Do not treat any folder in this repo as canonical edge function code.
 
-The `lovable-edge-functions/` folder has 3 newer functions (`approve-fam-trip`, `approve-site-inspection`, `ingest-site-inspection-from-onedrive`).
+Repository layout for edge functions (as of 2026-05-14 cleanup):
 
-**To modify an edge function**: do it in Lovable's chat UI. They deploy directly to Lovable Cloud. Mirror back to the repo only if you want a snapshot.
+- **`edge-functions.archive-2026-05-14/`** — Archived stale snapshots of 19 edge functions, captured pre-Phase 60.8. Preserved in git history for reference (e.g., to compare against old PDF/email rendering) but NOT current. If you need the live code, look in Lovable Cloud, not here.
+- **`lovable-edge-functions/`** — Three newer functions that Lovable's tooling mirrored here at some point (`approve-fam-trip`, `approve-site-inspection`, `ingest-site-inspection-from-onedrive`). These may also be stale relative to Lovable Cloud — treat as reference, not source of truth.
 
-This drift is tracked as a queued cleanup task — eventually decide whether the repo is source-of-truth (re-sync from Lovable) or documentation-only.
+**To modify an edge function**: do it via Lovable's chat UI. Lovable deploys directly to Lovable Cloud. There is no automatic mirror back to this repo.
+
+**To verify deployed code** (per the verification protocol after Lovable's false-claim pattern):
+1. Ask Lovable to paste the deployed function body in chat
+2. Or query Supabase: `select prosrc from pg_proc where proname = 'function_name';` (for Postgres functions)
+3. Don't rely on the repo's archive folder for current behavior
+
+**Future improvement**: build a periodic sync script that downloads current Lovable Cloud edge function code into a `edge-functions.lovable-sync/` folder. Not done yet (Tier 2 was an archive decision, not a sync investment).
 
 ---
 
