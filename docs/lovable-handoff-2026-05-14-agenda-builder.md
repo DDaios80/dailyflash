@@ -40,15 +40,25 @@ Two new pages on the dashboard.
 
 **Who sees it**: any admin/management user. Linked from a nav item visible to all admins.
 
+**Two-state lifecycle (Phase 70a)**: bullets can exist in two states:
+- **Draft** (`is_finalized = false`) — member's workspace. NOT visible to the chair's assembled agenda. Member can save, leave, come back, edit freely.
+- **Submitted** (`is_finalized = true`) — official input. Visible in chair's Block A. Editing automatically reverts to Draft (member must re-submit).
+
 **Layout**:
 
 ```
 Page title: Your status update for the Monday meeting
 
-Card: "Monday <DD Month YYYY> · 13:00 Athens · 120 min"
-      Due: Sunday <DD Month> 18:00 Athens
+Card header: "Monday <DD Month YYYY> · 13:00 Athens · 120 min"
+             Due: Sunday <DD Month> 18:00 Athens
 
-Form section: "Your status bullets (2-5 items, 1 per line)"
+Status indicator (top of form, prominent):
+  - If never saved:        "📝 Not started"
+  - If draft (saved):      "📝 Draft saved · last edited <relative time> · NOT YET SUBMITTED"
+  - If submitted:          "✅ Submitted to Chair <relative time> · visible in agenda"
+  - If submitted + edited: "⚠️ Edits pending · please re-submit"
+
+Form section: "Your status bullets"
   Bullet 1: [textarea, ~80 chars wide, growable]
   Bullet 2: [textarea]
   Bullet 3: [textarea]
@@ -56,25 +66,61 @@ Form section: "Your status bullets (2-5 items, 1 per line)"
   Bullet 5: [textarea]
   [+ Add another] (max 10)
 
-Status indicator at top of form:
-  - If never submitted: "Not yet submitted"
-  - If submitted: "Submitted <when> · revised N times"
-
-Buttons:
-  [Save] - calls excom_submit_status(meeting_date = next_monday(), bullets = non-empty bullets)
-  
-After save: toast "Status submitted. The chair will compile these into Monday's agenda."
+Button row (state-dependent):
+  - Never started state:
+    [Save draft]
+  - Draft state:
+    [Save draft]   [Review & submit →]
+  - Submitted state (clean, no edits):
+    [Edit (will revert to draft)]    [Withdraw submission]
+  - Submitted state (edits pending):
+    [Save draft]   [Review & re-submit →]
 ```
+
+**Review & submit flow**:
+
+Click "Review & submit" opens a modal:
+
+```
+┌─────────────────────────────────────────────────┐
+│  Preview your status as it will appear in       │
+│  Monday's agenda                                │
+│                                                 │
+│  ## A. Άνοιγμα · Status snapshot                │
+│                                                 │
+│  **<Your name>**: <bullet 1> | <bullet 2> |     │
+│                   <bullet 3>                    │
+│                                                 │
+│  ───────────────────────────────────────        │
+│                                                 │
+│  Once submitted, this becomes visible to the    │
+│  Chair. You can still edit later (reverts to    │
+│  draft, requires re-submit).                    │
+│                                                 │
+│  [← Back to edit]    [Submit to Chair ✓]        │
+└─────────────────────────────────────────────────┘
+```
+
+**Withdraw flow**:
+
+Click "Withdraw submission" → confirmation dialog → calls `excom_unfinalize_status(meeting_date)`. Bullets stay (still as draft); member can edit and re-submit.
+
+**RPC calls**:
+- "Save draft" button → `excom_submit_status(meeting_date, bullets)` — saves bullets, leaves is_finalized = false (or auto-reverts if previously submitted)
+- "Submit to Chair" button (in Review modal) → `excom_submit_status(meeting_date, bullets)` THEN `excom_finalize_status(meeting_date)` — atomic save-and-finalize
+- "Withdraw submission" → `excom_unfinalize_status(meeting_date)` — keeps draft, removes from agenda
 
 **Data fetch on page load**:
 - Query: `select * from excom_status_snapshots where meeting_date = (select next_monday()) and member_user_id = auth.uid()`
-- If exists: pre-fill bullets, show "Submitted/revised" status
-- If not: show empty form, "Not yet submitted"
+- Determine state from `is_finalized` flag + comparison of `updated_at` vs `finalized_at` to detect "edits pending after submit"
+- Pre-fill bullets if any exist
 
 **Edge cases**:
 - Filter out empty bullets before submitting (strip whitespace, ignore empty strings)
 - Min 1 bullet, max 10 (DB enforces, but show client-side validation)
-- Show submitted_at relative time ("Submitted 2 hours ago")
+- Show relative timestamps ("Saved 2 minutes ago", "Submitted 3 hours ago")
+- "Edits pending" state: detect when `is_finalized = false` BUT `revision_count > 0` AND `finalized_at IS NOT NULL` — means member submitted previously, then edited
+- Re-submitting an already-finalized snapshot via `excom_finalize_status` is idempotent (just bumps `finalized_at` timestamp)
 
 ---
 
@@ -99,10 +145,11 @@ Right column (40%): Sidebar — unplaced for_monday ideas + "Add custom item"
 
 Each block as a section with:
 - Heading: "A. Opening · 10 min" (fixed time for A and F, computed sum for others)
-- For Block A: read-only list of submitted status snapshots, showing:
-  - ✓ <Member name> · <N bullets> · submitted <relative time>
-  - · <Member name> · NOT SUBMITTED · [Remind via WhatsApp link]
-  - (Click row to expand bullets inline)
+- For Block A: read-only list combining `block_A_status_snapshots` (finalized) and `pending_status_drafts` (in-progress), showing:
+  - ✅ <Member name> · <N bullets> · submitted <relative time> — finalized, bullets visible (click row to expand)
+  - 📝 <Member name> · <N bullets drafted> · last edited <relative time> · NOT YET SUBMITTED — chair sees the member is working on it but bullets are not yet official input (do not include in published markdown)
+  - ⏳ <Member name> · not started — anyone in the expected ExCom list who has neither a draft nor a submission (frontend computes this from the expected-members list vs the union of finalized + draft)
+  - [Remind via WhatsApp link] button for not-started or stale-draft cases
 - For Blocks B-E: list of agenda_items in `position` order. Each row:
   - Drag handle ⋮⋮
   - Title (bold)
