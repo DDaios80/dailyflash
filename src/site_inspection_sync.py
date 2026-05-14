@@ -37,10 +37,15 @@ import requests
 from onedrive import GraphError, download_pdf_bytes, list_site_inspection_pdfs
 
 
-# Filename regex — INSPECTION VISIT - <AGENCY> - DD.MM.YY(YY).pdf
-# Tolerant of extra whitespace and either 2-digit or 4-digit year.
+# Filename regex — INSPECTION VISIT <sep> <AGENCY> <sep> DD.MM.YY(YY).pdf
+# Tolerant of:
+#   - hyphen OR underscore as field separator (seen both in the wild,
+#     e.g. "INSPECTION VISIT - EASYJET - 29.04.26.pdf" vs
+#          "INSPECTION VISIT_PAC GROUP_15.05.2026.pdf")
+#   - extra whitespace anywhere
+#   - 2-digit or 4-digit year
 _PATTERN = re.compile(
-    r"^INSPECTION\s*VISIT\s*-\s*(?P<agency>.+?)\s*-\s*"
+    r"^INSPECTION\s*VISIT\s*[-_]\s*(?P<agency>.+?)\s*[-_]\s*"
     r"(?P<d>\d{1,2})\.(?P<m>\d{1,2})\.(?P<y>\d{2,4})\.pdf$",
     re.IGNORECASE,
 )
