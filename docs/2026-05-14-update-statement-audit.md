@@ -24,7 +24,7 @@ Phase 56 and Phase 58 patched, but more instances exist.
 
 | # | File:line | Function | Bug |
 |---|-----------|----------|-----|
-| 1 | `db/phase25_ideas_chair_desk.sql:329` | `idea_need_committee` | Sets ONLY `status = 'in_discussion'`. No `_at`, no `_by`. **Worst offender.** Audit trail relies entirely on the inserted comment. |
+| 1 | `db/phase25_ideas_chair_desk.sql:329` | `idea_need_committee` | Sets ONLY `status = 'in_discussion'`. No dedicated `in_discussion_at` / `in_discussion_by`. **Mitigated**: `ideas` has a generic `updated_at` trigger (`_touch_ideas_updated_at`) so timestamp is captured; the inserted comment row carries `author_user_id` for actor. Schema is inconsistent with `idea_acknowledge`'s explicit `acknowledged_at/by` pattern, but operational audit trail exists. |
 | 2 | `db/phase25_ideas_chair_desk.sql:295` | `idea_solvable_now` | Sets `status, committee_response, resolved_at, closed_at`. Missing `resolved_by` / `closed_by`. |
 | 3 | `db/phase25_ideas_chair_desk.sql:357` | `idea_to_monday` | Sets `status, for_monday_at, for_monday_reason, monday_meeting_date`. Missing `for_monday_by`. |
 | 4 | `db/phase25_ideas_chair_desk.sql:554` | `idea_decide_at_monday` | Sets decision fields. Missing `decided_by` (which committee member at Monday meeting made the decision). |
@@ -55,38 +55,20 @@ incomplete `_by` audit columns:
 
 ## Recommended fixes (in priority order)
 
-### P0 — Patch `idea_need_committee` (5 min)
+### P0 — De-prioritized after deeper inspection
 
-The smoking-gun bug. Currently:
+`idea_need_committee`'s UPDATE has audit trail via two indirect paths:
+- `_touch_ideas_updated_at` trigger captures the timestamp on `updated_at`
+- The function inserts a comment in `idea_comments` carrying `author_user_id`
 
-```sql
-update ideas set status = 'in_discussion' where id = p_idea_id;
-```
+So while the schema lacks dedicated `in_discussion_at` + `in_discussion_by`
+columns (inconsistent with `idea_acknowledge`'s `acknowledged_at/by`
+pattern), the operational audit is intact. **Not a P0 bug.** Schema
+cleanup belongs with P2.
 
-Minimal patch (no schema change needed if we live with comment-trail
-audit, but add an updated_at touch):
-
-```sql
-update ideas set
-  status = 'in_discussion',
-  updated_at = now()
-where id = p_idea_id;
-```
-
-Full patch (requires new columns):
-
-```sql
-alter table ideas
-  add column if not exists in_discussion_at timestamptz,
-  add column if not exists in_discussion_by uuid references auth.users(id);
-
--- Then in the RPC:
-update ideas set
-  status = 'in_discussion',
-  in_discussion_at = now(),
-  in_discussion_by = auth.uid()
-where id = p_idea_id;
-```
+The lesson is more about CONSISTENCY than missing data. Either every
+state transition has dedicated `_at`/`_by` columns, or none do (rely on
+trigger + comments). Half-and-half is the smell.
 
 ### P1 — Patch all reject branches (3 RPCs, 15 min)
 
