@@ -353,6 +353,16 @@ def main() -> int:
         print(f"[cron] site-inspection sync failed (non-fatal): {type(e).__name__}: {e}",
               file=sys.stderr)
 
+    # Phase 14b — sync group PDFs from OneDrive (weddings, tour groups,
+    # MICE/conferences, retreats — mixed folder). No-op until
+    # INGEST_GROUP_URL is wired up. Best-effort: failures don't fail the cron.
+    try:
+        from group_sync import sync as group_sync
+        group_sync()
+    except Exception as e:
+        print(f"[cron] group sync failed (non-fatal): {type(e).__name__}: {e}",
+              file=sys.stderr)
+
     # Phase 60.3 — extraction-freshness sanity check.
     #
     # DISABLED 2026-05-15 (diagnostic: see this commit message).
