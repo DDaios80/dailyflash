@@ -47,6 +47,30 @@ _PATTERN_B = re.compile(
     r"^(?P<name>.+?)[\s_]+(?P<d1>\d{1,2})\.(?P<m1>\d{1,2})\s*-\s*(?P<d2>\d{1,2})\.(?P<m2>\d{1,2})\.(?P<y>\d{4})\.pdf$",
     re.IGNORECASE,
 )
+# Pattern C: <NAME> DD.MM.-DD.MM.YYYY.pdf — full date both sides, year only at
+# the end; optional dot before the dash; 2- or 4-digit year; tolerates
+# trailing whitespace before .pdf. Observed 2026-06:
+#   'AEGEANxAIRTOURS_FAM TRIP_11.06.-14.06.2026.pdf'
+#   'DOM CO_FAM TRIP_09.06.-12.06.2026.pdf'
+#   'AIRTOURS AUSTRIA FAM TRIP 21.05.-24.05.2026.pdf'
+#   'MRS. HALABI_PRESS_TRIP_09.05.-11.05.26.pdf'
+_PATTERN_C = re.compile(
+    r"^(?P<name>.+?)[\s_]+(?P<d1>\d{1,2})\.(?P<m1>\d{1,2})\.?\s*-\s*"
+    r"(?P<d2>\d{1,2})\.(?P<m2>\d{1,2})\.(?P<y>\d{4}|\d{2})\s*\.pdf$",
+    re.IGNORECASE,
+)
+# Pattern D: <NAME> DD.MM.YY-DD.MM.YY.pdf — year on both sides, 2 or 4 digits.
+# Observed 2026-06: 'ElegantResort_FAM TRIP_04.06.26-07.06.26.pdf'
+_PATTERN_D = re.compile(
+    r"^(?P<name>.+?)[\s_]+(?P<d1>\d{1,2})\.(?P<m1>\d{1,2})\.(?P<y1>\d{4}|\d{2})\s*-\s*"
+    r"(?P<d2>\d{1,2})\.(?P<m2>\d{1,2})\.(?P<y2>\d{4}|\d{2})\s*\.pdf$",
+    re.IGNORECASE,
+)
+
+
+def _norm_year(y: int) -> int:
+    """Two-digit years are 2000s: 26 -> 2026."""
+    return y + 2000 if y < 100 else y
 
 
 def parse_filename(name: str) -> Optional[tuple[str, date, date]]:
@@ -70,6 +94,32 @@ def parse_filename(name: str) -> Optional[tuple[str, date, date]]:
             d1 = int(m["d1"]); m1 = int(m["m1"])
             d2 = int(m["d2"]); m2 = int(m["m2"])
             yr = int(m["y"])
+            start = date(yr, m1, d1)
+            end   = date(yr, m2, d2)
+        except ValueError:
+            return None
+        return (_clean_name(m["name"]), start, end)
+
+    # Pattern D before C: with a year on the first date ('04.06.26-...'),
+    # C's optional-dot branch cannot match it, but checking D first keeps
+    # the intent explicit.
+    m = _PATTERN_D.match(name)
+    if m:
+        try:
+            d1 = int(m["d1"]); m1 = int(m["m1"]); y1 = _norm_year(int(m["y1"]))
+            d2 = int(m["d2"]); m2 = int(m["m2"]); y2 = _norm_year(int(m["y2"]))
+            start = date(y1, m1, d1)
+            end   = date(y2, m2, d2)
+        except ValueError:
+            return None
+        return (_clean_name(m["name"]), start, end)
+
+    m = _PATTERN_C.match(name)
+    if m:
+        try:
+            d1 = int(m["d1"]); m1 = int(m["m1"])
+            d2 = int(m["d2"]); m2 = int(m["m2"])
+            yr = _norm_year(int(m["y"]))
             start = date(yr, m1, d1)
             end   = date(yr, m2, d2)
         except ValueError:

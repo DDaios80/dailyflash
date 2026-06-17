@@ -57,21 +57,28 @@ _PATTERN = re.compile(
 
 
 def parse_filename(name: str) -> Optional[tuple[str, date]]:
-    """Parse a group PDF filename. Returns (group_name, start_date) or None
-    if no pattern matches. Two-digit years are normalised to 20YY."""
+    """Parse a group PDF filename. Returns (group_name, start_date) or None.
+
+    First tries the strict GROUP-prefix pattern. If that fails, falls back to
+    fam_trip_sync's broader patterns so files in the GROUPS folder without a
+    'GROUP' token (e.g. TITAN, BXR GROUP, NOW YOGA) also ingest. The OneDrive
+    folder location is what makes them groups; the filename shape doesn't."""
     m = _PATTERN.match(name)
-    if not m:
+    if m:
+        try:
+            d = int(m["d"])
+            mo = int(m["m"])
+            y = int(m["y"])
+            if y < 100:
+                y += 2000
+            return (_clean_name(m["name"]), date(y, mo, d))
+        except ValueError:
+            pass
+    from fam_trip_sync import parse_filename as _fam_parse
+    fam_result = _fam_parse(name)
+    if fam_result is None:
         return None
-    try:
-        d = int(m["d"])
-        mo = int(m["m"])
-        y = int(m["y"])
-        if y < 100:
-            y += 2000
-        start_date = date(y, mo, d)
-    except ValueError:
-        return None
-    return (_clean_name(m["name"]), start_date)
+    return (fam_result[0], fam_result[1])
 
 
 def _clean_name(raw: str) -> str:

@@ -286,7 +286,11 @@ def main() -> int:
     # Thelxi's intra-day room-change re-exports without operator clicks.
     if args.auto_quick:
         try:
-            from datetime import timezone
+            # NOTE: do NOT re-import timezone here — a local
+            # `from datetime import timezone` makes `timezone` local to this
+            # whole function, breaking every use ABOVE this line with
+            # UnboundLocalError (bit us 2026-05-14..06-12: Phase 47 v2 check
+            # failed on every run). Module-level import (top of file) suffices.
             xlsx_mtime = datetime.fromtimestamp(
                 Path(xlsx).stat().st_mtime, tz=timezone.utc,
             )
@@ -512,5 +516,9 @@ def _parse_iso_date(s: str):
         return _d.today()
 
 
+from heartbeat import heartbeat
+
 if __name__ == "__main__":
-    sys.exit(main())
+    with heartbeat("daily-flash-cron"):
+        rc = main()
+    sys.exit(rc or 0)

@@ -7,16 +7,21 @@
 #   4. Variables → paste env (see .env.example).
 #
 # Cron schedule: Railway cron is in UTC (NOT respecting TZ env var — confirmed
-# via Railway UI showing "At HH:MM (UTC)" labels). Current setting is tuned for
-# summer (EEST = UTC+3):
-#   16:30 UTC = 19:30 Athens EEST (summer, April-October)
-#             = 18:30 Athens EET  (winter, October-March  ← 1h off)
-# Pipeline fires ~30 min before the 20:00 Athens email dispatcher so
-# flash_reports is fresh for tomorrow's date.
+# via Railway UI showing "At HH:MM (UTC)" labels). Tuned for summer (EEST=UTC+3).
 #
-# DST reminder — on the last Sunday of October (EEST→EET), bump this to
-# "30 17 * * *" (= 17:30 UTC = 19:30 Athens EET). Reverse on the last
-# Sunday of March.
+# Phase 70 — runs THREE evening passes instead of one, so a late flash xlsx
+# upload is caught the same night (the job the Mac's 18:00/20:30/23:00 local
+# runs used to do). The PDF document syncs are NO LONGER part of this service
+# (moved to railway.documents.toml, every 30 min) — this service is the flash
+# xlsx pipeline only.
+#   30 16 UTC = 19:30 Athens EEST   (primary, ~30 min before the email dispatcher)
+#   30 18 UTC = 21:30 Athens EEST   (late-catch #1)
+#   30 20 UTC = 23:30 Athens EEST   (late-catch #2)
+# The flash upsert is idempotent and Phase 47 v2 skips back-to-back runs, so
+# re-runs when the xlsx is unchanged are cheap (A-lister cache + comment_hash).
+#
+# DST reminder — on the last Sunday of October (EEST→EET, UTC+2), shift each
+# hour back by one: "30 15,17,19 * * *". Reverse on the last Sunday of March.
 
 [build]
 builder = "DOCKERFILE"
@@ -24,5 +29,5 @@ dockerfilePath = "Dockerfile"
 
 [deploy]
 startCommand = "python -u src/cron.py"
-cronSchedule = "30 16 * * *"
+cronSchedule = "30 16,18,20 * * *"
 restartPolicyType = "NEVER"

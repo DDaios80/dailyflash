@@ -1,0 +1,38 @@
+# Phase 70 — Railway config for the document-sync poller service.
+#
+# Runs ONLY the fam-trip / site-inspection / group PDF syncs (via the
+# Microsoft Graph API) every 30 minutes, independent of the heavy flash
+# xlsx pipeline. Replaces the Mac's role as the late-upload catcher: any
+# PDF Thelxi drops in OneDrive is ingested within 30 min, regardless of
+# whether any workstation is awake.
+#
+# WHY a separate service: cron.py only runs the PDF syncs at the tail of
+# its full pipeline, and in --auto-quick mode it returns early (skipping
+# the syncs) when the flash xlsx is unchanged. This service decouples the
+# cheap document syncs from the expensive, once-a-day flash run.
+#
+# HOW TO USE (multi-service-from-one-repo, same pattern as
+# railway.escalation.toml / railway.webhook.toml):
+#   1. Railway project (helpful-patience) → New Service → "Empty Service"
+#   2. Settings → Source → connect DDaios80/dailyflash, branch: main
+#   3. Settings → Config-as-code → set path to `railway.documents.toml`
+#   4. Variables → copy from the dailyflash service:
+#        SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, PIPELINE_SECRET,
+#        INGEST_FAM_TRIP_URL, INGEST_SITE_INSPECTION_URL, INGEST_GROUP_URL,
+#        ONEDRIVE_FAM_IMPORT_USER_ID, and all MSGRAPH_* refresh-token vars.
+#      (Do NOT set DAILY_FLASH_INBOX — this service never touches the local
+#       xlsx folder; it uses Graph API only.)
+#
+# Schedule: every 30 minutes, all day. Railway cron is UTC; */30 is
+# timezone-agnostic so no DST adjustment is ever needed for this service.
+# Each run is a few seconds (list folders + download only new PDFs + POST),
+# so the 48 runs/day are cheap.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -u src/sync_documents.py"
+cronSchedule = "*/30 * * * *"
+restartPolicyType = "NEVER"
