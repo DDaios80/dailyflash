@@ -234,6 +234,35 @@ BOOKING_COM_TRAVEL_AGENTS = _PROPERTY.booking_com_travel_agents
 TOUR_OPERATOR_KEYWORDS = _PROPERTY.tour_operator_keywords
 
 
+# Guests to keep off every arrival surface (privacy/VIP requests). Applied to
+# the arrival lists here and the A-lister research in daily.py. Occupancy and
+# in-house lists are untouched — this only hides the *arrival*.
+SUPPRESSED_ARRIVAL_NAMES = _PROPERTY.suppressed_arrival_names
+
+
+def _norm_name(s: str) -> str:
+    """Lower-case, strip accents/diacritics, collapse whitespace."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return " ".join(s.lower().split())
+
+
+def is_suppressed_arrival(r: dict[str, Any]) -> bool:
+    """True if this guest is on the property's arrival-suppression list.
+    Each entry is a group of tokens (e.g. first name + surname); the guest is
+    suppressed when ALL tokens in any group appear in their first+surname,
+    accent-/case-/order-insensitive. Tolerant of Opera export formatting quirks;
+    only the primary guest name is checked."""
+    if not SUPPRESSED_ARRIVAL_NAMES:
+        return False
+    blob = _norm_name(f"{r.get('guest_first_name') or ''} {r.get('guest_name') or ''}")
+    return any(
+        all(_norm_name(tok) in blob for tok in group)
+        for group in SUPPRESSED_ARRIVAL_NAMES
+    )
+
+
 def is_tour_operator_stay(r: dict[str, Any]) -> bool:
     """True if the reservation comes through a commercial tour operator
     or bulk channel. Used to exclude industry comp stays from
@@ -605,7 +634,10 @@ def compute_flash(
     occ_tomorrow.label = "TOMORROW"
     occ_following.label = "FOLLOWING"
 
-    arrivals = [r for r in records if _arrives_on(r, report_date)]
+    arrivals = [
+        r for r in records
+        if _arrives_on(r, report_date) and not is_suppressed_arrival(r)
+    ]
     departures_ = [r for r in records if _departs_on(r, report_date)]
     in_house = [r for r in records if _in_house_on(r, report_date)]
 

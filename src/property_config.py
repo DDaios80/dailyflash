@@ -41,6 +41,12 @@ class PropertyConfig:
     notable_agent_keywords: tuple[str, ...] = ()
     tour_operator_keywords: tuple[str, ...] = ()
     booking_com_travel_agents: tuple[str, ...] = ("BOOKING", "BOOK")
+    # Guests to keep OFF every arrival surface of the flash (the arrival lists
+    # and the A-lister guest research), e.g. privacy/VIP requests. Each entry is
+    # a group of name tokens that must ALL appear in the guest's first+surname
+    # (accent-/case-/order-insensitive) to suppress. Occupancy totals and
+    # in-house lists are unaffected. Reversible: remove the entry.
+    suppressed_arrival_names: tuple[tuple[str, ...], ...] = ()
 
 
 # Default channel keyword pools. Properties can override per-config; if
@@ -64,6 +70,7 @@ _CONFIGS: dict[str, PropertyConfig] = {
         onedrive_folder="Daios Cove Crete/DailyFlash",
         notable_agent_keywords=_DEFAULT_NOTABLE,
         tour_operator_keywords=_DEFAULT_TOUR_OP,
+        suppressed_arrival_names=(("theopisti", "pourliotopoulou"),),
     ),
 
     "DLL": PropertyConfig(

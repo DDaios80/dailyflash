@@ -29,7 +29,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from ingest import parse_file
-from compute import compute_flash, _in_house_on, merge_zoho_into_flash
+from compute import compute_flash, _in_house_on, merge_zoho_into_flash, is_suppressed_arrival
 from zoho_fetch import fetch_zoho_for_report, size_summary as zoho_size_summary
 from alister import (
     subjects_from_reservation,
@@ -479,6 +479,7 @@ def run_daily(
         today_arrivals = [
             r for r in records
             if isinstance(r.get("arrival"), datetime) and r["arrival"].date() == report_date
+            and not is_suppressed_arrival(r)
         ]
         subjects = [s for r in today_arrivals for s in subjects_from_reservation(r)]
         print(f"[3/5] A-lister: {len(subjects)} subjects from {len(today_arrivals)} arrivals")
