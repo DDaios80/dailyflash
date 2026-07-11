@@ -67,7 +67,10 @@ _CONFIGS: dict[str, PropertyConfig] = {
         location="Crete",
         description="Daios Cove, a 5-star resort on Crete",
         total_sellable_rooms=276,
-        onedrive_folder="Daios Cove Crete/DailyFlash",
+        # 2026-07-11: OneDrive top folder renamed "Daios Cove Crete" -> "Daios Cove".
+        # The fetch actually reads MSGRAPH_ONEDRIVE_FOLDER from env (Railway);
+        # this default is kept in sync so a missing env var fails loud-and-right.
+        onedrive_folder="Daios Cove/DailyFlash",
         notable_agent_keywords=_DEFAULT_NOTABLE,
         tour_operator_keywords=_DEFAULT_TOUR_OP,
         suppressed_arrival_names=(("theopisti", "pourliotopoulou"),),
