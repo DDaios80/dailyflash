@@ -4,6 +4,16 @@ Uses OAuth2 refresh-token flow (delegated permissions). No tenant admin
 consent required. The refresh token is captured once via `tools/auth_onedrive.py`
 and stored in Railway env as MSGRAPH_REFRESH_TOKEN.
 
+2026-07-22 — SELF-RENEWING TOKEN. Azure rotates the refresh token on every
+use and expires any single token string 90 days after issuance, even if
+presented daily (proven by the 2026-07-20 outage: the static env token from
+2026-04-21 died mid-July while in nightly use). We now persist the newest
+rotated token in app_settings (key: msgraph_refresh_token) via the supa
+client and prefer it over the env var, so the 90-day clock resets on every
+run. The env var remains the bootstrap + fallback: if the persisted token is
+dead (e.g. after a manual re-auth), the env token is tried and its rotation
+re-seeds the DB. Persistence is best-effort and never fails the pipeline.
+
 Permissions needed on the Azure AD app:
     Files.Read (delegated)
     offline_access (for refresh token)
@@ -27,41 +37,108 @@ import requests
 SCOPES = ["Files.Read", "offline_access"]
 _GRAPH = "https://graph.microsoft.com/v1.0"
 
+# app_settings key holding the newest rotated refresh token (see module
+# docstring). Read/written via the service-role supa client only.
+_DB_TOKEN_KEY = "msgraph_refresh_token"
+
 
 class GraphError(RuntimeError):
     pass
 
 
+def _load_persisted_token() -> Optional[str]:
+    """Best-effort read of the newest rotated refresh token. None on any
+    failure — callers fall back to the env token."""
+    try:
+        from supa import client as _supa_client
+        row = (
+            _supa_client()
+            .table("app_settings")
+            .select("value")
+            .eq("key", _DB_TOKEN_KEY)
+            .maybe_single()
+            .execute()
+        )
+        val = ((getattr(row, "data", None) or {}).get("value") or "").strip()
+        return val or None
+    except Exception as e:
+        print(f"[graph-token] persisted-token read failed (using env): "
+              f"{type(e).__name__}: {e}")
+        return None
+
+
+def _persist_rotated_token(new_rt: str) -> None:
+    """Best-effort upsert of the rotated refresh token. Loud on failure
+    (same rationale as the Phase 47 heartbeat) but never raises."""
+    try:
+        from supa import client as _supa_client
+        _supa_client().table("app_settings").upsert(
+            {"key": _DB_TOKEN_KEY, "value": new_rt},
+            on_conflict="key",
+        ).execute()
+        print(f"[graph-token] rotated refresh token persisted "
+              f"({len(new_rt)} chars)")
+    except Exception as e:
+        print(f"[graph-token] FAILED to persist rotated token (non-fatal, "
+              f"but the 90-day clock is NOT reset): {type(e).__name__}: {e}")
+
+
 def _config() -> dict:
     cid = os.environ.get("MSGRAPH_CLIENT_ID") or ""
     tid = os.environ.get("MSGRAPH_TENANT_ID") or "common"
-    rt = os.environ.get("MSGRAPH_REFRESH_TOKEN") or ""
+    env_rt = os.environ.get("MSGRAPH_REFRESH_TOKEN") or ""
     folder = os.environ.get("MSGRAPH_ONEDRIVE_FOLDER") or "DailyFlash"
-    if not cid or not rt:
+    if not cid or not env_rt:
         raise GraphError(
             "MSGRAPH_CLIENT_ID and MSGRAPH_REFRESH_TOKEN must be set in env"
         )
-    return {"client_id": cid, "tenant_id": tid, "refresh_token": rt, "folder": folder}
+    # Prefer the newest rotated token (self-renewing); env is bootstrap +
+    # fallback when the persisted one is missing or dead.
+    db_rt = _load_persisted_token()
+    rt = db_rt or env_rt
+    fallback = env_rt if (db_rt and db_rt != env_rt) else ""
+    return {
+        "client_id": cid, "tenant_id": tid, "folder": folder,
+        "refresh_token": rt, "fallback_refresh_token": fallback,
+    }
 
 
-def _refresh_access_token(cfg: dict) -> str:
-    """Exchange refresh_token → access_token via MS OAuth 2.0 endpoint."""
+def _token_request(cfg: dict, refresh_token: str) -> requests.Response:
     url = f"https://login.microsoftonline.com/{cfg['tenant_id']}/oauth2/v2.0/token"
-    r = requests.post(
+    return requests.post(
         url,
         data={
             "client_id": cfg["client_id"],
             "grant_type": "refresh_token",
-            "refresh_token": cfg["refresh_token"],
+            "refresh_token": refresh_token,
             "scope": " ".join(SCOPES),
         },
         timeout=30,
     )
+
+
+def _refresh_access_token(cfg: dict) -> str:
+    """Exchange refresh_token → access_token via MS OAuth 2.0 endpoint.
+
+    Tries the primary (persisted) token first; if Azure rejects it and an
+    env fallback exists, retries once with that (covers a dead DB token
+    after a manual re-auth). Persists the rotated refresh token returned
+    by whichever attempt succeeds, so the 90-day clock keeps resetting."""
+    used_rt = cfg["refresh_token"]
+    r = _token_request(cfg, used_rt)
+    if r.status_code >= 400 and cfg.get("fallback_refresh_token"):
+        print(f"[graph-token] persisted token rejected "
+              f"({r.status_code}) — retrying with env token")
+        used_rt = cfg["fallback_refresh_token"]
+        r = _token_request(cfg, used_rt)
     if r.status_code >= 400:
         raise GraphError(f"token refresh failed ({r.status_code}): {r.text[:500]}")
     data = r.json()
     if "access_token" not in data:
         raise GraphError(f"no access_token in response: {data}")
+    new_rt = (data.get("refresh_token") or "").strip()
+    if new_rt and new_rt != used_rt:
+        _persist_rotated_token(new_rt)
     return data["access_token"]
 
 

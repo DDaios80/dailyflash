@@ -10,9 +10,14 @@ d.daios@daioshotels.com (or whoever owns the OneDrive folder), enter the code,
 grant the Files.Read + offline_access permissions. The refresh token prints
 at the end — paste it into Railway as MSGRAPH_REFRESH_TOKEN.
 
-Refresh tokens are long-lived (90 days rolling by default, but auto-refresh
-whenever Railway actually uses them — so effectively perpetual as long as
-the pipeline runs at least once every 90 days).
+TOKEN LIFETIME (corrected 2026-07-22 after the outage): Azure expires any
+single refresh-token STRING 90 days after issuance even if used daily —
+using it returns a rotated replacement that must be persisted. onedrive.py
+now persists rotations in app_settings (key: msgraph_refresh_token) and
+prefers that over the env var, so the pipeline self-renews. After running
+this tool (fresh re-auth), just update the env var: if the persisted DB
+token is dead, onedrive.py falls back to the env token automatically and
+re-seeds the DB with its rotation.
 """
 from __future__ import annotations
 
