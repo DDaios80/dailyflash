@@ -98,6 +98,8 @@ def main() -> int:
                     help="Skip slow steps (LLM extractions + A-lister research). For intra-day re-syncs after a room change. Existing extractions / findings stay attached via Phase 28.4 UPSERT, so the dashboard sees fresh occupancy + special-attention without a 5-min wait.")
     ap.add_argument("--auto-quick", action="store_true",
                     help="Polling mode: detect if OneDrive xlsx was modified after the last upload's uploaded_at, and only run quick pipeline if so. Use as a 15-30 min Railway cron to pick up Thelxi's intra-day room-change re-uploads automatically.")
+    ap.add_argument("--if-new", action="store_true",
+                    help="Change-gated FULL run: exit 0 without posting when the OneDrive xlsx is not newer than the last ingest; run the complete pipeline (extraction included) when it is. Unlike --auto-quick this never degrades to quick mode — safe for scheduled catch-up passes (late-morning uploads).")
     ap.add_argument("--force", action="store_true",
                     help="Bypass Phase 47 v2 back-to-back skip (run even if the last successful pipeline finished < 5 min ago).")
     args = ap.parse_args()
@@ -284,42 +286,57 @@ def main() -> int:
     # OneDrive isn't newer, exit silently — nothing changed since the
     # last cron. Used as a 15-30 min Railway poll job that picks up
     # Thelxi's intra-day room-change re-exports without operator clicks.
-    if args.auto_quick:
+    if args.auto_quick or args.if_new:
+        mode = "if-new" if args.if_new else "auto-quick"
         try:
             # NOTE: do NOT re-import timezone here — a local
             # `from datetime import timezone` makes `timezone` local to this
             # whole function, breaking every use ABOVE this line with
             # UnboundLocalError (bit us 2026-05-14..06-12: Phase 47 v2 check
             # failed on every run). Module-level import (top of file) suffices.
+            #
+            # The local file's mtime mirrors OneDrive's lastModifiedDateTime
+            # (set by onedrive._download_item since 2026-07-26), so this
+            # compares the SOURCE's modification time against the last ingest.
             xlsx_mtime = datetime.fromtimestamp(
                 Path(xlsx).stat().st_mtime, tz=timezone.utc,
             )
+            # A birthdays-only re-upload should also count as "new".
+            if birthdays_path:
+                xlsx_mtime = max(xlsx_mtime, datetime.fromtimestamp(
+                    Path(birthdays_path).stat().st_mtime, tz=timezone.utc,
+                ))
             from supa import client as _supa_client
             sb = _supa_client()
-            rows = sb.table("uploads").select("uploaded_at").order(
-                "uploaded_at", desc=True,
-            ).limit(1).execute().data or []
-            last_upload_at = (
-                datetime.fromisoformat(rows[0]["uploaded_at"].replace("Z", "+00:00"))
-                if rows else None
-            )
-            if last_upload_at and xlsx_mtime <= last_upload_at:
+            # Compare against OUR marker of the last successfully ingested
+            # source mtimes (app_settings, written at end-of-run). The old
+            # comparison read uploads.uploaded_at via the supa client, but
+            # that table is NOT where the edge fn records ingests — it was
+            # frozen (last row 2026-04-21), so every run looked "newer" and
+            # the gate never skipped.
+            row = sb.table("app_settings").select("value").eq(
+                "key", "last_ingested_source_mtime",
+            ).maybe_single().execute()
+            marker = ((getattr(row, "data", None) or {}).get("value") or "").strip()
+            last_ingested = datetime.fromisoformat(marker) if marker else None
+            if last_ingested and xlsx_mtime <= last_ingested:
                 print(
-                    f"[cron] auto-quick: OneDrive xlsx ({xlsx_mtime.isoformat()}) "
-                    f"is not newer than last upload ({last_upload_at.isoformat()}). "
+                    f"[cron] {mode}: source files ({xlsx_mtime.isoformat()}) "
+                    f"not newer than last ingested ({last_ingested.isoformat()}). "
                     f"Nothing to do."
                 )
                 return 0
             print(
-                f"[cron] auto-quick: OneDrive xlsx ({xlsx_mtime.isoformat()}) "
-                f"is newer than last upload "
-                f"({last_upload_at.isoformat() if last_upload_at else 'none'}). "
-                f"Running quick pipeline."
+                f"[cron] {mode}: source files ({xlsx_mtime.isoformat()}) "
+                f"newer than last ingested "
+                f"({last_ingested.isoformat() if last_ingested else 'none'}). "
+                f"Running {'FULL' if args.if_new else 'quick'} pipeline."
             )
-            args.quick = True   # auto-quick implies --quick
+            if not args.if_new:
+                args.quick = True   # auto-quick implies --quick; --if-new stays FULL
         except Exception as e:
             print(
-                f"[cron] auto-quick check failed ({type(e).__name__}: {e}). "
+                f"[cron] {mode} check failed ({type(e).__name__}: {e}). "
                 f"Falling through to normal run.",
                 file=sys.stderr,
             )
@@ -431,6 +448,25 @@ def main() -> int:
         _resp_data = getattr(_resp, "data", None)
         if _resp_data:
             print(f"[cron] Phase 47 v2: wrote cron_last_finish_at = {_now_iso}")
+        # Record the ingested source files' max mtime so --if-new /
+        # --auto-quick can skip when nothing changed (best-effort).
+        try:
+            _src_mtime = datetime.fromtimestamp(
+                Path(xlsx).stat().st_mtime, tz=timezone.utc,
+            )
+            if birthdays_path:
+                _src_mtime = max(_src_mtime, datetime.fromtimestamp(
+                    Path(birthdays_path).stat().st_mtime, tz=timezone.utc,
+                ))
+            _supa_client().table("app_settings").upsert(
+                {"key": "last_ingested_source_mtime",
+                 "value": _src_mtime.isoformat()},
+                on_conflict="key",
+            ).execute()
+            print(f"[cron] wrote last_ingested_source_mtime = {_src_mtime.isoformat()}")
+        except Exception as _e2:
+            print(f"[cron] failed to persist last_ingested_source_mtime "
+                  f"(non-fatal): {type(_e2).__name__}: {_e2}", file=sys.stderr)
         else:
             # If supabase-py returns no data on a successful upsert this
             # is normal; but it also masked the v1 silent-fail. Log the

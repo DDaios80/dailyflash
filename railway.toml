@@ -9,25 +9,36 @@
 # Cron schedule: Railway cron is in UTC (NOT respecting TZ env var — confirmed
 # via Railway UI showing "At HH:MM (UTC)" labels). Tuned for summer (EEST=UTC+3).
 #
-# Phase 70 — runs THREE evening passes instead of one, so a late flash xlsx
-# upload is caught the same night (the job the Mac's 18:00/20:30/23:00 local
-# runs used to do). The PDF document syncs are NO LONGER part of this service
-# (moved to railway.documents.toml, every 30 min) — this service is the flash
-# xlsx pipeline only.
+# Phase 70 — THREE evening passes so a late flash xlsx upload is caught the
+# same night (the job the Mac's 18:00/20:30/23:00 local runs used to do).
+# 2026-07-26 — TWO morning catch-up passes added after a late-morning upload
+# (10:27 Athens) went unprocessed all day: the evening passes had already
+# built that day's flash from the stale previous export. The PDF document
+# syncs are NOT part of this service (railway.documents.toml, every 30 min).
+#   30 05 UTC = 08:30 Athens EEST   (morning catch-up #1 — late uploads)
+#   30 08 UTC = 11:30 Athens EEST   (morning catch-up #2 — late uploads)
 #   30 16 UTC = 19:30 Athens EEST   (primary, ~30 min before the email dispatcher)
 #   30 18 UTC = 21:30 Athens EEST   (late-catch #1)
 #   30 20 UTC = 23:30 Athens EEST   (late-catch #2)
-# The flash upsert is idempotent and Phase 47 v2 skips back-to-back runs, so
-# re-runs when the xlsx is unchanged are cheap (A-lister cache + comment_hash).
+#
+# All passes run --if-new: exit-without-posting when neither the flash xlsx
+# nor the birthdays xlsx is newer (by OneDrive lastModifiedDateTime) than the
+# last ingest; FULL pipeline (extraction included) when one is. This makes
+# the extra passes near-free on quiet days and also stops the old behaviour
+# of 3 full re-extractions every night. NOTE: --if-new is NOT --auto-quick —
+# auto-quick degrades to quick mode (skips extraction; caused the 2026-06-23
+# missing-comments incident) and must not be scheduled.
+# Known limitation: a change made in Opera WITHOUT a re-uploaded export is
+# invisible to any schedule — the export file is the source of truth.
 #
 # DST reminder — on the last Sunday of October (EEST→EET, UTC+2), shift each
-# hour back by one: "30 15,17,19 * * *". Reverse on the last Sunday of March.
+# hour back by one: "30 4,7,15,17,19 * * *". Reverse on the last Sunday of March.
 
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "python -u src/cron.py"
-cronSchedule = "30 16,18,20 * * *"
+startCommand = "python -u src/cron.py --if-new"
+cronSchedule = "30 5,8,16,18,20 * * *"
 restartPolicyType = "NEVER"

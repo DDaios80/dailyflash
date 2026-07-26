@@ -27,7 +27,7 @@ Env vars:
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -143,7 +143,11 @@ def _refresh_access_token(cfg: dict) -> str:
 
 
 def _download_item(item: dict, headers: dict, target_dir: Path) -> Path:
-    """Download a Graph item (xlsx) to target_dir and return the local path."""
+    """Download a Graph item (xlsx) to target_dir and return the local path.
+
+    Sets the local file's mtime to OneDrive's lastModifiedDateTime so
+    change-detection (cron.py --if-new / --auto-quick) compares the SOURCE's
+    modification time, not the moment we happened to download it."""
     dl = item.get("@microsoft.graph.downloadUrl") or f"{_GRAPH}/me/drive/items/{item['id']}/content"
     target_dir.mkdir(parents=True, exist_ok=True)
     local_path = target_dir / item["name"]
@@ -151,6 +155,13 @@ def _download_item(item: dict, headers: dict, target_dir: Path) -> Path:
     if rr.status_code >= 400:
         raise GraphError(f"download failed ({rr.status_code}): {rr.text[:500]}")
     local_path.write_bytes(rr.content)
+    lm = item.get("lastModifiedDateTime")
+    if lm:
+        try:
+            ts = datetime.fromisoformat(lm.replace("Z", "+00:00")).timestamp()
+            os.utime(local_path, (ts, ts))
+        except Exception:
+            pass  # best-effort; a wrong mtime only weakens change-detection
     return local_path
 
 
