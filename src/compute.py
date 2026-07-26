@@ -161,6 +161,31 @@ COMMENT_ATTENTION_PHRASES = (
 )
 
 
+# 2026-07-26 — industry-VIP titles in COMMENTS promote to Special Attention.
+# Reservations often carry notes like "Vice President of Zakynthos Lesante
+# Luxury Hotel & Spa" with no VIP code set in Opera; hospitality peers
+# deserve the Special Attention list even when web research (A-lister)
+# finds no public notability. Matched with word boundaries, so e.g.
+# "PRESIDENTIAL SUITE" does not fire "president".
+INDUSTRY_VIP_KEYWORDS = (
+    "vice president",
+    "vice-president",
+    "ceo",
+    "chief executive",
+    "managing director",
+    # "of" required: "Ceremony conducted by the General Manager" (our own
+    # GM at a guest's wedding) must not promote the couple.
+    "general manager of",
+    "hotel owner",
+    "owner of",
+    "hotelier",
+    "chairman",
+    "διευθύνων σύμβουλος",
+    "γενικός διευθυντής",
+    "ιδιοκτήτης ξενοδοχείου",
+)
+
+
 # Phase 38 — patterns identifying guests who are themselves travel-trade
 # representatives staying at the property (FAM trips, site inspections,
 # individual TA familiarisations). Distinct from regular guests booked
@@ -321,6 +346,18 @@ def _comment_attention_match(r: dict[str, Any]) -> str | None:
     return None
 
 
+def industry_vip_match(r: dict[str, Any]) -> str | None:
+    """Return the matched industry-VIP title phrase from COMMENTS, or None.
+    Word-boundary matched so substrings inside other words don't fire."""
+    c = (r.get("comments") or "").lower()
+    if not c:
+        return None
+    for kw in INDUSTRY_VIP_KEYWORDS:
+        if re.search(r"\b" + re.escape(kw) + r"\b", c):
+            return kw
+    return None
+
+
 def _special_request_codes(r: dict[str, Any]) -> set[str]:
     raw = (r.get("special_requests") or "").upper()
     return {code.strip() for code in raw.replace(",", " ").split() if code.strip()}
@@ -384,6 +421,12 @@ def special_attention_reason(r: dict[str, Any]) -> str | None:
     # guests booked THROUGH a TA.
     if _is_travel_agent_guest(r):
         reasons.append("Travel Agent")
+
+    # 2026-07-26 — industry-VIP title mentioned in the reservation comments
+    # (e.g. "Vice President of ... Hotel & Spa") with no VIP code in Opera.
+    ivip = industry_vip_match(r)
+    if ivip:
+        reasons.append(f"Industry VIP ({ivip})")
 
     # De-dupe while preserving order
     seen: set[str] = set()
