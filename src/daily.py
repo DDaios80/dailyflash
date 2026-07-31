@@ -304,23 +304,40 @@ def run_daily(
             hash_comment,
         )
 
-        # Phase 60.5 — force re-extraction of every in-house guest every
-        # cron. Phase 48's hash-based "only re-extract changed comments"
-        # optimization is currently unavailable: the
-        # ``comment_extractions.comment_hash`` column doesn't exist on
-        # the deployed schema, and the prior prefetch query also
-        # referenced ``comment_extractions.resv_name_id`` which doesn't
-        # exist either. Both raised 42703 every cron, silently falling
-        # back to arrival-window only — so in-house guests whose comments
-        # changed mid-stay (upsells, FOC Pool Fence package additions,
-        # late-checkout requests) were NEVER picked up.
-        #
-        # Until comment_hash is added, populate existing_hash_by_rnid
-        # with None for every in-house reservation. ``None != current_hash``
-        # is always true in select_extraction_candidates, so every
-        # in-house guest with a non-empty comment gets re-extracted.
-        # Cost: ~5-10 extra USD/cron in Claude calls. Benefit: in-house
-        # comment edits actually reach the dashboard.
+        # 2026-07-31 — extraction cache (replaces Phase 60.5 force-all and
+        # the never-functional Phase 48 DB stamping, which read/wrote the
+        # WRONG database: the supa client points at the old April project,
+        # not the prod DB the ingest edge fn writes to). The cache lives in
+        # app_settings (key extraction_cache_v1) in the store the pipeline
+        # already reliably uses for its heartbeat/marker/token:
+        #   { "<resv_name_id>": {"h": <comment sha256>, "e": {extraction}} }
+        # Guests whose comment hash is unchanged skip the LLM entirely and
+        # reuse the cached extraction in the envelope — arrivals included,
+        # since an identical comment yields an identical extraction.
+        # Cache-load failure degrades to the previous behaviour (re-extract
+        # every in-house guest + all arrivals).
+        _cache: dict[int, dict] = {}
+        try:
+            import json as _json
+            from supa import client as _supa_client_cache
+            _row = (
+                _supa_client_cache()
+                .table("app_settings")
+                .select("value")
+                .eq("key", "extraction_cache_v1")
+                .maybe_single()
+                .execute()
+            )
+            _raw = ((getattr(_row, "data", None) or {}).get("value") or "").strip()
+            if _raw:
+                _cache = {int(k): v for k, v in _json.loads(_raw).items()
+                          if isinstance(v, dict) and v.get("h") and isinstance(v.get("e"), dict)}
+            print(f"       extraction cache: {len(_cache)} entries loaded")
+        except Exception as _e:
+            print(f"       extraction cache load failed (re-extracting all): "
+                  f"{type(_e).__name__}: {_e}")
+            _cache = {}
+
         existing_hash_by_rnid: dict[int, str | None] = {}
         try:
             for _r in records:
@@ -336,15 +353,11 @@ def run_daily(
                     continue
                 _rnid = _r.get("resv_name_id")
                 if _rnid is not None:
-                    existing_hash_by_rnid[_rnid] = None  # forces re-extraction
-            print(
-                f"       Phase 60.5: forcing re-extraction of "
-                f"{len(existing_hash_by_rnid)} in-house guests "
-                f"(comment_hash optimization unavailable)"
-            )
+                    # Known hash gates on change; None forces re-extraction.
+                    existing_hash_by_rnid[_rnid] = (_cache.get(_rnid) or {}).get("h")
         except Exception as _e:
             print(
-                f"       Phase 60.5 in-house map failed (continuing with "
+                f"       in-house map failed (continuing with "
                 f"arrival-window only): {type(_e).__name__}: {_e}"
             )
             existing_hash_by_rnid = {}
@@ -359,14 +372,29 @@ def run_daily(
             and report_date <= r["arrival"].date() <= report_date + timedelta(days=extract_window_days)
         )
         n_in_house = len(in_scope) - n_arrivals
-        print(
-            f"[2/5] Extracting from {len(in_scope)} in-scope reservations "
-            f"({n_arrivals} arrivals + {n_in_house} in-house with changed comments)..."
-        )
-        extractions, errors, es = asyncio.run(extract_batch(in_scope))
-        extractions_by_rnid = {rid: ext.model_dump() for rid, ext in extractions.items()}
 
-        print(f"       {es['succeeded']}/{es['total']} ok, {es['failed']} failed")
+        # Split candidates: reuse the cached extraction when the comment is
+        # byte-identical (normalised) to what was last extracted.
+        _to_extract: list[dict] = []
+        _reused: dict[int, dict] = {}
+        for _r in in_scope:
+            _rnid = _r.get("resv_name_id")
+            _entry = _cache.get(_rnid) if _rnid is not None else None
+            if _entry and _entry.get("h") == hash_comment(_r.get("comments")):
+                _reused[_rnid] = _entry["e"]
+            else:
+                _to_extract.append(_r)
+        print(
+            f"[2/5] Extracting from {len(_to_extract)} of {len(in_scope)} in-scope "
+            f"reservations ({n_arrivals} arrivals + {n_in_house} in-house with "
+            f"changed comments; {len(_reused)} unchanged, reused from cache)..."
+        )
+        extractions, errors, es = asyncio.run(extract_batch(_to_extract))
+        extractions_by_rnid = {rid: ext.model_dump() for rid, ext in extractions.items()}
+        extractions_by_rnid.update(_reused)
+
+        print(f"       {es['succeeded']}/{es['total']} ok, {es['failed']} failed"
+              f" (+{len(_reused)} from cache)")
     else:
         print(f"[2/5] --no-extract (skipped)")
 
@@ -384,6 +412,42 @@ def run_daily(
     #
     # Best-effort. If the DB fetch fails (RLS, network), we fall
     # through to the old behaviour — no preservation, but no breakage.
+    if not extractions_by_rnid:
+        # 2026-07-31 — preserve from the extraction cache first: it holds the
+        # results of OUR last successful extraction. The DB path below reads
+        # the supa-client project, which is NOT where ingests land (it served
+        # April-era rows on 2026-07-31) — kept only as a last resort.
+        try:
+            import json as _json_p52
+            from supa import client as _supa_client_p52
+            _row = (
+                _supa_client_p52()
+                .table("app_settings")
+                .select("value")
+                .eq("key", "extraction_cache_v1")
+                .maybe_single()
+                .execute()
+            )
+            _raw = ((getattr(_row, "data", None) or {}).get("value") or "").strip()
+            if _raw:
+                _c = _json_p52.loads(_raw)
+                _rnids_now = {r.get("resv_name_id") for r in records}
+                _from_cache = {
+                    int(k): v["e"] for k, v in _c.items()
+                    if isinstance(v, dict) and isinstance(v.get("e"), dict)
+                    and int(k) in _rnids_now
+                }
+                if _from_cache:
+                    extractions_by_rnid = _from_cache
+                    print(
+                        f"       Phase 52: preserved {len(_from_cache)} "
+                        f"comment_extractions from the extraction cache "
+                        f"(skipped fresh extraction in --quick mode)"
+                    )
+        except Exception as _e:
+            print(f"       Phase 52 cache preservation failed (trying DB): "
+                  f"{type(_e).__name__}: {_e}")
+
     if not extractions_by_rnid:
         try:
             from supa import client as _supa_client
@@ -1253,37 +1317,31 @@ def run_daily(
     # doesn't roll back the pipeline; the worst case is the next cron
     # re-extracts in-house guests (a no-op for unchanged comments, plus
     # a small LLM cost).
+    # 2026-07-31 — persist the extraction cache (replaces the old comment_hash
+    # stamping, which updated the supa-client project where the ingested rows
+    # never lived, so it always stamped 0). One JSON blob in app_settings:
+    # every entry in extractions_by_rnid with its current comment hash. Next
+    # run reuses these for unchanged comments instead of calling the LLM.
     if extracted_comment_hashes and resp and resp.get("ok"):
-        upload_id = resp.get("upload_id") or (resp.get("verification") or {}).get("upload_id")
-        if upload_id:
+        if True:
             try:
+                import json as _json_cw
                 from supa import client as _supa_client
                 _sb = _supa_client()
-                rows = (
-                    _sb.table("reservations")
-                    .select("id, resv_name_id")
-                    .eq("upload_id", upload_id)
-                    .in_("resv_name_id", list(extracted_comment_hashes.keys()))
-                    .execute()
-                    .data
-                    or []
-                )
-                rid_by_rnid = {row["resv_name_id"]: row["id"] for row in rows}
-                stamped = 0
-                for rnid, comment_hash in extracted_comment_hashes.items():
-                    rid = rid_by_rnid.get(rnid)
-                    if not rid:
-                        continue
-                    try:
-                        _sb.table("comment_extractions").update(
-                            {"comment_hash": comment_hash}
-                        ).eq("reservation_id", rid).execute()
-                        stamped += 1
-                    except Exception:
-                        pass
+                _cache_out = {
+                    str(_rnid): {"h": _h, "e": extractions_by_rnid[_rnid]}
+                    for _rnid, _h in extracted_comment_hashes.items()
+                    if _rnid in extractions_by_rnid
+                }
+                _sb.table("app_settings").upsert(
+                    {"key": "extraction_cache_v1",
+                     "value": _json_cw.dumps(_cache_out, default=str)},
+                    on_conflict="key",
+                ).execute()
+                stamped = len(_cache_out)
                 print(
-                    f"       Phase 48: stamped comment_hash on "
-                    f"{stamped}/{len(extracted_comment_hashes)} extraction rows"
+                    f"       Phase 48: extraction cache written "
+                    f"({stamped} entries)"
                 )
             except Exception as _e:
                 print(
