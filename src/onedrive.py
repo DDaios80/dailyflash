@@ -23,6 +23,15 @@ Env vars:
     MSGRAPH_TENANT_ID          Tenant ID or 'common' (default 'common')
     MSGRAPH_REFRESH_TOKEN      Captured via auth_onedrive.py
     MSGRAPH_ONEDRIVE_FOLDER    Path relative to root (default 'DailyFlash')
+
+2026-09-25 — APP MODE (off the personal account). When MSGRAPH_APP_CLIENT_ID,
+MSGRAPH_APP_CLIENT_SECRET and MSGRAPH_DRIVE_ID are all set, the module signs
+in as the app itself (client credentials, Graph application permission
+Sites.Selected, granted read on one SharePoint site) and reads that site's
+document library instead of /me/drive. MSGRAPH_TENANT_ID must then be the
+tenant GUID, and MSGRAPH_ONEDRIVE_FOLDER is the folder path inside the
+library. Without those three vars the delegated refresh-token flow above is
+used unchanged.
 """
 from __future__ import annotations
 
@@ -44,6 +53,28 @@ _DB_TOKEN_KEY = "msgraph_refresh_token"
 
 class GraphError(RuntimeError):
     pass
+
+
+def _app_mode() -> bool:
+    return all(os.environ.get(k) for k in
+               ("MSGRAPH_APP_CLIENT_ID", "MSGRAPH_APP_CLIENT_SECRET", "MSGRAPH_DRIVE_ID"))
+
+
+def configured() -> bool:
+    """True when either Graph mode has its credentials (cron.py gate)."""
+    return _app_mode() or bool(
+        os.environ.get("MSGRAPH_CLIENT_ID") and os.environ.get("MSGRAPH_REFRESH_TOKEN"))
+
+
+def _drive() -> str:
+    """Graph base URL of the drive we read: the site library in app mode,
+    the signed-in user's OneDrive otherwise."""
+    if _app_mode():
+        return f"{_GRAPH}/drives/{os.environ['MSGRAPH_DRIVE_ID']}"
+    return f"{_GRAPH}/me/drive"
+
+
+_app_token: dict = {}
 
 
 def _load_persisted_token() -> Optional[str]:
@@ -84,6 +115,8 @@ def _persist_rotated_token(new_rt: str) -> None:
 
 
 def _config() -> dict:
+    if _app_mode():
+        return {"app": True, "folder": os.environ.get("MSGRAPH_ONEDRIVE_FOLDER") or "DailyFlash"}
     cid = os.environ.get("MSGRAPH_CLIENT_ID") or ""
     tid = os.environ.get("MSGRAPH_TENANT_ID") or "common"
     env_rt = os.environ.get("MSGRAPH_REFRESH_TOKEN") or ""
@@ -123,7 +156,27 @@ def _refresh_access_token(cfg: dict) -> str:
     Tries the primary (persisted) token first; if Azure rejects it and an
     env fallback exists, retries once with that (covers a dead DB token
     after a manual re-auth). Persists the rotated refresh token returned
-    by whichever attempt succeeds, so the 90-day clock keeps resetting."""
+    by whichever attempt succeeds, so the 90-day clock keeps resetting.
+
+    In app mode: client-credentials token, cached until 5 min before expiry."""
+    if cfg.get("app"):
+        now = datetime.now(timezone.utc).timestamp()
+        if _app_token.get("exp", 0) > now + 300:
+            return _app_token["token"]
+        tid = os.environ.get("MSGRAPH_TENANT_ID") or ""
+        r = requests.post(
+            f"https://login.microsoftonline.com/{tid}/oauth2/v2.0/token",
+            data={"client_id": os.environ["MSGRAPH_APP_CLIENT_ID"],
+                  "client_secret": os.environ["MSGRAPH_APP_CLIENT_SECRET"],
+                  "grant_type": "client_credentials",
+                  "scope": "https://graph.microsoft.com/.default"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            raise GraphError(f"app token request failed ({r.status_code}): {r.text[:500]}")
+        data = r.json()
+        _app_token.update(token=data["access_token"], exp=now + int(data.get("expires_in", 3600)))
+        return data["access_token"]
     used_rt = cfg["refresh_token"]
     r = _token_request(cfg, used_rt)
     if r.status_code >= 400 and cfg.get("fallback_refresh_token"):
@@ -148,7 +201,7 @@ def _download_item(item: dict, headers: dict, target_dir: Path) -> Path:
     Sets the local file's mtime to OneDrive's lastModifiedDateTime so
     change-detection (cron.py --if-new / --auto-quick) compares the SOURCE's
     modification time, not the moment we happened to download it."""
-    dl = item.get("@microsoft.graph.downloadUrl") or f"{_GRAPH}/me/drive/items/{item['id']}/content"
+    dl = item.get("@microsoft.graph.downloadUrl") or f"{_drive()}/items/{item['id']}/content"
     target_dir.mkdir(parents=True, exist_ok=True)
     local_path = target_dir / item["name"]
     rr = requests.get(dl, headers=headers, timeout=180)
@@ -169,7 +222,7 @@ def _list_xlsx(folder_path: str, headers: dict) -> Optional[list[dict]]:
     """List xlsx items in a folder, sorted by lastModifiedDateTime desc.
     Returns None if folder doesn't exist."""
     list_url = (
-        f"{_GRAPH}/me/drive/root:/{folder_path}:/children"
+        f"{_drive()}/root:/{folder_path}:/children"
         "?$orderby=lastModifiedDateTime desc&$top=50"
         "&$select=id,name,lastModifiedDateTime,@microsoft.graph.downloadUrl"
     )
@@ -293,7 +346,7 @@ def fetch_xlsx_by_name(name: str, target_dir: Path) -> Path:
     token = _refresh_access_token(cfg)
     headers = {"Authorization": f"Bearer {token}"}
 
-    list_url = f"{_GRAPH}/me/drive/root:/{cfg['folder']}:/children?$top=200"
+    list_url = f"{_drive()}/root:/{cfg['folder']}:/children?$top=200"
     r = requests.get(list_url, headers=headers, timeout=30)
     r.raise_for_status()
     items = r.json().get("value", [])
@@ -301,7 +354,7 @@ def fetch_xlsx_by_name(name: str, target_dir: Path) -> Path:
     if not match:
         raise GraphError(f"xlsx '{name}' not found in OneDrive folder '{cfg['folder']}'")
 
-    dl = match.get("@microsoft.graph.downloadUrl") or f"{_GRAPH}/me/drive/items/{match['id']}/content"
+    dl = match.get("@microsoft.graph.downloadUrl") or f"{_drive()}/items/{match['id']}/content"
     target_dir.mkdir(parents=True, exist_ok=True)
     local_path = target_dir / match["name"]
     rr = requests.get(dl, headers=headers, timeout=180)
@@ -345,7 +398,7 @@ def list_fam_trip_pdfs() -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     folder_path = f"{cfg['folder']}/FAM TRIPS"
     list_url = (
-        f"{_GRAPH}/me/drive/root:/{folder_path}:/children"
+        f"{_drive()}/root:/{folder_path}:/children"
         "?$orderby=lastModifiedDateTime desc&$top=200"
         "&$select=id,name,lastModifiedDateTime,size,@microsoft.graph.downloadUrl"
     )
@@ -370,7 +423,7 @@ def list_site_inspection_pdfs() -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     folder_path = f"{cfg['folder']}/SITE INSPECTIONS"
     list_url = (
-        f"{_GRAPH}/me/drive/root:/{folder_path}:/children"
+        f"{_drive()}/root:/{folder_path}:/children"
         "?$orderby=lastModifiedDateTime desc&$top=200"
         "&$select=id,name,lastModifiedDateTime,size,@microsoft.graph.downloadUrl"
     )
@@ -397,7 +450,7 @@ def list_group_pdfs() -> list[dict]:
     headers = {"Authorization": f"Bearer {token}"}
     folder_path = f"{cfg['folder']}/GROUPS"
     list_url = (
-        f"{_GRAPH}/me/drive/root:/{folder_path}:/children"
+        f"{_drive()}/root:/{folder_path}:/children"
         "?$orderby=lastModifiedDateTime desc&$top=200"
         "&$select=id,name,lastModifiedDateTime,size,@microsoft.graph.downloadUrl"
     )
@@ -416,7 +469,7 @@ def download_pdf_bytes(item: dict) -> bytes:
     cfg = _config()
     token = _refresh_access_token(cfg)
     headers = {"Authorization": f"Bearer {token}"}
-    dl = item.get("@microsoft.graph.downloadUrl") or f"{_GRAPH}/me/drive/items/{item['id']}/content"
+    dl = item.get("@microsoft.graph.downloadUrl") or f"{_drive()}/items/{item['id']}/content"
     rr = requests.get(dl, headers=headers, timeout=180)
     if rr.status_code >= 400:
         raise GraphError(f"PDF download failed ({rr.status_code}): {rr.text[:500]}")

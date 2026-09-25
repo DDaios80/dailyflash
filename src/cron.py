@@ -214,7 +214,8 @@ def main() -> int:
     # the missed upload.
     birthdays_path: Path | None = None
     today_athens = datetime.now().date()  # Railway service runs with TZ=Europe/Athens
-    if os.environ.get("MSGRAPH_CLIENT_ID") and os.environ.get("MSGRAPH_REFRESH_TOKEN"):
+    from onedrive import configured as _graph_configured
+    if _graph_configured():
         from onedrive import (
             fetch_daily_flash_for_date, fetch_birthdays_for_date, GraphError,
         )
