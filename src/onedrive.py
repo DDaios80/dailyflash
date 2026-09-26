@@ -32,10 +32,20 @@ document library instead of /me/drive. MSGRAPH_TENANT_ID must then be the
 tenant GUID, and MSGRAPH_ONEDRIVE_FOLDER is the folder path inside the
 library. Without those three vars the delegated refresh-token flow above is
 used unchanged.
+
+2026-09-26 — SWITCH-OVER + ONE-WEEK SAFETY NET. In app mode the folder inside the
+site library is MSGRAPH_SITE_FOLDER (default "Daily Flash"); MSGRAPH_ONEDRIVE_FOLDER
+keeps naming the old personal-OneDrive folder. Until FALLBACK_UNTIL, when the
+delegated credentials are still present, the daily xlsx and birthdays fall back
+to the personal OneDrive if the site has no file for the date, and the PDF
+listings include both places (ingest dedups server-side). After that date the
+fallback switches itself off; then remove MSGRAPH_REFRESH_TOKEN.
 """
 from __future__ import annotations
 
+import json
 import os
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -55,9 +65,34 @@ class GraphError(RuntimeError):
     pass
 
 
-def _app_mode() -> bool:
+FALLBACK_UNTIL = date(2026, 10, 3)
+_FORCE_LEGACY = False
+
+
+def _app_creds() -> bool:
     return all(os.environ.get(k) for k in
                ("MSGRAPH_APP_CLIENT_ID", "MSGRAPH_APP_CLIENT_SECRET", "MSGRAPH_DRIVE_ID"))
+
+
+def _app_mode() -> bool:
+    return _app_creds() and not _FORCE_LEGACY
+
+
+def _fallback_active() -> bool:
+    """Transition week: app mode is on, but the personal OneDrive can still be read."""
+    return (_app_creds() and date.today() <= FALLBACK_UNTIL
+            and bool(os.environ.get("MSGRAPH_CLIENT_ID") and os.environ.get("MSGRAPH_REFRESH_TOKEN")))
+
+
+@contextmanager
+def _legacy():
+    """Temporarily read the personal OneDrive (delegated flow) while in app mode."""
+    global _FORCE_LEGACY
+    prev, _FORCE_LEGACY = _FORCE_LEGACY, True
+    try:
+        yield
+    finally:
+        _FORCE_LEGACY = prev
 
 
 def configured() -> bool:
@@ -116,7 +151,7 @@ def _persist_rotated_token(new_rt: str) -> None:
 
 def _config() -> dict:
     if _app_mode():
-        return {"app": True, "folder": os.environ.get("MSGRAPH_ONEDRIVE_FOLDER") or "DailyFlash"}
+        return {"app": True, "folder": os.environ.get("MSGRAPH_SITE_FOLDER") or "Daily Flash"}
     cid = os.environ.get("MSGRAPH_CLIENT_ID") or ""
     tid = os.environ.get("MSGRAPH_TENANT_ID") or "common"
     env_rt = os.environ.get("MSGRAPH_REFRESH_TOKEN") or ""
@@ -308,7 +343,7 @@ def fetch_latest_xlsx(target_dir: Path) -> Path:
     )
 
 
-def fetch_daily_flash_for_date(
+def _fetch_daily_flash_for_date(
     export_date: date, target_dir: Path,
 ) -> tuple[Path, bool]:
     """Download the Daily Flash xlsx whose filename matches `export_date`
@@ -373,7 +408,7 @@ def fetch_latest_xlsx_from_subfolder(subfolder: str, target_dir: Path) -> Option
     )
 
 
-def fetch_birthdays_for_date(
+def _fetch_birthdays_for_date(
     export_date: date, target_dir: Path,
 ) -> tuple[Optional[Path], bool]:
     """Download the birthdays xlsx from DailyFlash/Birthdays/ matching
@@ -387,7 +422,7 @@ def fetch_birthdays_for_date(
 
 # ─── Phase 28 — FAM trip PDFs ─────────────────────────────────────────────
 
-def list_fam_trip_pdfs() -> list[dict]:
+def _list_fam_trip_pdfs() -> list[dict]:
     """List PDFs in {folder}/FAM TRIPS/. Returns Graph item dicts with
     keys: id, name, lastModifiedDateTime, size, @microsoft.graph.downloadUrl.
     Skips non-PDF files (e.g. weekly xlsx report).
@@ -413,7 +448,7 @@ def list_fam_trip_pdfs() -> list[dict]:
 
 # ─── Phase 44 — Site inspection PDFs ──────────────────────────────────────
 
-def list_site_inspection_pdfs() -> list[dict]:
+def _list_site_inspection_pdfs() -> list[dict]:
     """List PDFs in {folder}/SITE INSPECTIONS/. Mirrors list_fam_trip_pdfs.
     Skips non-PDF files (.msg/.eml Outlook exports are out of scope for now).
     Returns [] if folder doesn't exist or has no PDFs.
@@ -438,7 +473,7 @@ def list_site_inspection_pdfs() -> list[dict]:
 
 # ─── Phase 14b — Group PDFs ──────────────────────────────────────────────
 
-def list_group_pdfs() -> list[dict]:
+def _list_group_pdfs() -> list[dict]:
     """List PDFs in {folder}/GROUPS/. Mirrors list_site_inspection_pdfs.
     Folder holds mixed group types: tour groups, weddings, corporate retreats,
     MICE/conferences, etc. The ingest edge function classifies type from
@@ -463,7 +498,7 @@ def list_group_pdfs() -> list[dict]:
     return [it for it in items if (it.get("name") or "").lower().endswith(".pdf")]
 
 
-def download_pdf_bytes(item: dict) -> bytes:
+def _download_pdf_bytes(item: dict) -> bytes:
     """Download a Graph PDF item directly to memory. The pipeline streams
     the bytes to the ingest edge function via base64 — no local disk write."""
     cfg = _config()
@@ -474,3 +509,78 @@ def download_pdf_bytes(item: dict) -> bytes:
     if rr.status_code >= 400:
         raise GraphError(f"PDF download failed ({rr.status_code}): {rr.text[:500]}")
     return rr.content
+
+
+# ─── 2026-09-26 — public entry points with the transition-week fallback ────
+
+def fetch_daily_flash_for_date(export_date: date, target_dir: Path) -> tuple[Path, bool]:
+    """Site first; during the transition week, the personal OneDrive when the
+    site has no file for `export_date` (see module docstring)."""
+    site, err = None, None
+    try:
+        site = _fetch_daily_flash_for_date(export_date, target_dir)
+    except GraphError as e:
+        err = e
+    if _fallback_active() and (site is None or site[1]):
+        try:
+            with _legacy():
+                old = _fetch_daily_flash_for_date(export_date, target_dir)
+            if site is None or not old[1]:
+                print(f"[graph] transition fallback: using personal OneDrive file {old[0].name}")
+                return old
+        except GraphError as e:
+            print(f"[graph] transition fallback failed: {e}")
+    if site is None:
+        raise err
+    return site
+
+
+def fetch_birthdays_for_date(export_date: date, target_dir: Path) -> tuple[Optional[Path], bool]:
+    path, stale = _fetch_birthdays_for_date(export_date, target_dir)
+    if _fallback_active() and (path is None or stale):
+        try:
+            with _legacy():
+                old, old_stale = _fetch_birthdays_for_date(export_date, target_dir)
+            if old and (path is None or not old_stale):
+                print(f"[graph] transition fallback: birthdays from personal OneDrive {old.name}")
+                return old, old_stale
+        except GraphError as e:
+            print(f"[graph] transition fallback (birthdays) failed: {e}")
+    return path, stale
+
+
+# PDF names that already existed on the personal OneDrive at the switch-over
+# (2026-09-26). Copies of them on the site get new item ids, and the group /
+# site-inspection ingest dedups by item id, so they are skipped for good.
+_PRE_SWITCH = json.loads((Path(__file__).with_name("pre_switch_pdfs.json")).read_text(encoding="utf-8"))
+
+
+def _both(lister) -> list[dict]:
+    known = set(_PRE_SWITCH.get(lister.__name__.strip("_"), []))
+    items = [it for it in lister() if it.get("name") not in known]
+    if _fallback_active():
+        try:
+            with _legacy():
+                items += [dict(it, _legacy=True) for it in lister()]
+        except GraphError as e:
+            print(f"[graph] transition fallback listing failed: {e}")
+    return items
+
+
+def list_fam_trip_pdfs() -> list[dict]:
+    return _both(_list_fam_trip_pdfs)
+
+
+def list_site_inspection_pdfs() -> list[dict]:
+    return _both(_list_site_inspection_pdfs)
+
+
+def list_group_pdfs() -> list[dict]:
+    return _both(_list_group_pdfs)
+
+
+def download_pdf_bytes(item: dict) -> bytes:
+    if item.get("_legacy"):
+        with _legacy():
+            return _download_pdf_bytes(item)
+    return _download_pdf_bytes(item)
