@@ -18,7 +18,8 @@
 #   30 05 UTC = 08:30 Athens EEST   (morning catch-up #1 — late uploads)
 #   30 08 UTC = 11:30 Athens EEST   (morning catch-up #2 — late uploads)
 #   30 16 UTC = 19:30 Athens EEST   (primary, ~30 min before the email dispatcher)
-#   30 18 UTC = 21:30 Athens EEST   (late-catch #1)
+#   30 17 UTC = 20:30 Athens EEST   (late-catch #1; was 21:30 until 2026-10-01 — an
+#                                    upload at 20:26 that night waited an extra hour)
 #   30 20 UTC = 23:30 Athens EEST   (late-catch #2)
 #
 # All passes run --if-new: exit-without-posting when neither the flash xlsx
@@ -32,7 +33,7 @@
 # invisible to any schedule — the export file is the source of truth.
 #
 # DST reminder — on the last Sunday of October (EEST→EET, UTC+2), shift each
-# hour back by one: "30 4,7,15,17,19 * * *". Reverse on the last Sunday of March.
+# hour back by one: "30 4,7,15,16,19 * * *". Reverse on the last Sunday of March.
 
 [build]
 builder = "DOCKERFILE"
@@ -40,5 +41,5 @@ dockerfilePath = "Dockerfile"
 
 [deploy]
 startCommand = "python -u src/cron.py --if-new"
-cronSchedule = "30 5,8,16,18,20 * * *"
+cronSchedule = "30 5,8,16,17,20 * * *"
 restartPolicyType = "NEVER"
