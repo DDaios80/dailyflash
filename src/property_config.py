@@ -47,6 +47,10 @@ class PropertyConfig:
     # (accent-/case-/order-insensitive) to suppress. Occupancy totals and
     # in-house lists are unaffected. Reversible: remove the entry.
     suppressed_arrival_names: tuple[tuple[str, ...], ...] = ()
+    # The property's own company as it appears in Opera's company field on
+    # complimentary stays. It says nothing about who the guest is, so the
+    # A-lister research must not treat it as the guest's employer.
+    own_company_names: tuple[str, ...] = ()
 
 
 # Default channel keyword pools. Properties can override per-config; if
@@ -74,6 +78,7 @@ _CONFIGS: dict[str, PropertyConfig] = {
         notable_agent_keywords=_DEFAULT_NOTABLE,
         tour_operator_keywords=_DEFAULT_TOUR_OP,
         suppressed_arrival_names=(("theopisti", "pourliotopoulou"),),
+        own_company_names=("HELLAS HOLIDAY HOTELS",),
     ),
 
     "DLL": PropertyConfig(

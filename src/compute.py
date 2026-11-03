@@ -358,6 +358,67 @@ def industry_vip_match(r: dict[str, Any]) -> str | None:
     return None
 
 
+# 2026-11-03 — dignitaries named in COMMENTS promote to Special Attention.
+# The Ambassador of India arrived as "TOP VIP - EXTRA ATTENTION" with no
+# title in Opera; when reception writes the role, this surfaces it.
+# "ambassador" alone is NOT enough: the notes also use it in the marketing
+# sense ("να την κάνουμε ambassador", "ambassador των Sunday Natural"), so
+# it needs a country ("Ambassador of India", "Indian Ambassador") or a
+# diplomatic word next to it. Word boundaries keep "consultant" out, and a
+# relative or aide of a minister ("cousin of the Italian Minister of
+# Defense") is not the dignitary. Matched on accent-free lower-case text.
+import re  # the module's main `import re` sits further down; patterns compile at import
+from countries import COUNTRY_NAMES, DEMONYMS
+
+_COUNTRY_RX = "|".join(re.escape(c) for c in sorted(COUNTRY_NAMES, key=len, reverse=True))
+_DEMONYM_RX = "|".join(re.escape(d) for d in sorted(DEMONYMS, key=len, reverse=True))
+DIGNITARY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (label, re.compile(rx)) for label, rx in (
+        ("Ambassador", rf"\bambassador\s+(?:of|to)\s+(?:the\s+)?(?:{_COUNTRY_RX})\b"),
+        ("Ambassador", rf"\b(?:{_DEMONYM_RX})\s+ambassador\b"),
+        ("Ambassador", r"\bπρεσβ(?:η|ης|υ|υς|ειρα|εως)\b"),
+        ("H.E.", r"\b(?:his|her)\s+excellency\b|\bh\.\s?e\.(?=\s)|\bεξοχοτατ"),
+        ("Embassy", r"\bembassy\b|\bπρεσβει(?:α|ας)\b"),
+        ("Consul", r"\bconsul(?:ate)?\b|\bπροξεν(?:ος|ου|ο|οι|ων|ειο|ειου)\b"),
+        ("Minister", r"\bminister\b|\b(?:υφ)?υπουργ(?:ος|ου|ο|οι|ων|ισσα)\b"),
+    )
+)
+_DIGNITARY_RELATIVE_RX = re.compile(
+    r"\b(?:cousin|brother|sister|son|daughter|wife|husband|relative|friend|nephew|niece"
+    r"|assistant|secretary|driver|bodyguard)s?\s+of\b"
+    r"|\b(?:ξαδερφ|ξαδελφ|αδερφ|αδελφ|γιος|κορη|συζυγ|φιλ|ανιψι|γραμματε)\w*\s+(?:του|της)\b"
+)
+
+
+def dignitary_match(r: dict[str, Any]) -> str | None:
+    """Return the dignitary title found in COMMENTS ("Ambassador", "Minister",
+    …), or None. A title right after "cousin of …" / "ξάδερφος του …" (within
+    ~40 characters) belongs to someone else and does not count."""
+    c = _norm_name(r.get("comments") or "")
+    if not c:
+        return None
+    for label, rx in DIGNITARY_PATTERNS:
+        for m in rx.finditer(c):
+            if not _DIGNITARY_RELATIVE_RX.search(c[max(0, m.start() - 40):m.start()]):
+                return label
+    return None
+
+
+# 2026-11-03 — "TOP VIP" in the Opera notes is the front office's own flag
+# for the most important guests (34 bookings in the 2026 season: athletes,
+# agency owners, the Ambassador of India). It puts the guest on the A-lister
+# panel even when web research cannot confirm who they are.
+_TOP_VIP_RX = re.compile(r"\btop\s*vip\b", re.I)
+
+
+def front_office_top_vip(r: dict[str, Any]) -> str | None:
+    """Return the comment line that flags the guest "TOP VIP", or None."""
+    for line in (r.get("comments") or "").splitlines():
+        if _TOP_VIP_RX.search(line):
+            return " ".join(line.split())[:160]
+    return None
+
+
 def _special_request_codes(r: dict[str, Any]) -> set[str]:
     raw = (r.get("special_requests") or "").upper()
     return {code.strip() for code in raw.replace(",", " ").split() if code.strip()}
@@ -427,6 +488,11 @@ def special_attention_reason(r: dict[str, Any]) -> str | None:
     ivip = industry_vip_match(r)
     if ivip:
         reasons.append(f"Industry VIP ({ivip})")
+
+    # 2026-11-03 — ambassador / minister / consul named in the comments.
+    dig = dignitary_match(r)
+    if dig:
+        reasons.append(f"Dignitary ({dig})")
 
     # De-dupe while preserving order
     seen: set[str] = set()

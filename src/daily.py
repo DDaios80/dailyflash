@@ -29,7 +29,10 @@ from typing import Any
 from dotenv import load_dotenv
 
 from ingest import parse_file
-from compute import compute_flash, _in_house_on, merge_zoho_into_flash, is_suppressed_arrival
+from compute import (
+    compute_flash, _in_house_on, merge_zoho_into_flash, is_suppressed_arrival,
+    front_office_top_vip,
+)
 from zoho_fetch import fetch_zoho_for_report, size_summary as zoho_size_summary
 from alister import (
     subjects_from_reservation,
@@ -158,6 +161,7 @@ def assemble_payload_in_memory(
     # (review_status is computed in alister.py from confidence + disprove pass).
     rec_by_rnid = {r.get("resv_name_id"): r for r in records if r.get("resv_name_id")}
     al_panel_rows: list[dict] = []
+    panel_rnids: set = set()
     for rnid, finds in findings_by_rnid.items():
         for f in finds:
             status = f.get("review_status") or "needs_review"
@@ -179,6 +183,40 @@ def assemble_payload_in_memory(
                 "room": rec.get("room"),
                 "guest_on_booking": guest,
             })
+            panel_rnids.add(rnid)
+    # 2026-11-03 — guests the front office flags "TOP VIP" in Opera always
+    # reach the panel, even when web research can't tell who they are (the
+    # Ambassador of India, a common name, was missed). Same scope as the
+    # research: today's arrivals. A research row for the booking wins.
+    for rec in records:
+        rnid = rec.get("resv_name_id")
+        arr = rec.get("arrival")
+        if (rnid is None or rnid in panel_rnids or not isinstance(arr, datetime)
+                or arr.date() != report_date or is_suppressed_arrival(rec)):
+            continue
+        note = front_office_top_vip(rec)
+        if not note:
+            continue
+        guest = f"{(rec.get('guest_first_name') or '').strip()} {(rec.get('guest_name') or '').strip()}".strip()
+        al_panel_rows.append({
+            "matched_name": guest,
+            "relationship": "self",
+            "is_notable": True,
+            "confidence": 100,
+            "category": "Front office VIP",
+            "summary": f"Flagged by the front office in Opera: \u201c{note}\u201d",
+            "evidence_urls": [],
+            "reasoning": None,
+            "photo_url": None,
+            "disprove_confidence": 0,
+            "disprove_reasoning": None,
+            "nationality_aligned": None,
+            "review_status": "confirmed",
+            "source": "front_office",
+            "room": rec.get("room"),
+            "guest_on_booking": guest,
+        })
+        panel_rnids.add(rnid)
     # Sort: confirmed first, then needs_review; within tier, by confidence desc.
     al_panel_rows.sort(
         key=lambda a: (
